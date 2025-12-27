@@ -91,22 +91,38 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
             if (debug_enable)
             {
                 if (debug->step_debugger && !m_m6502->IsHalted())
+                {
+                    Log("RunToVBlankTemplate: Stopping due to step_debugger");
                     stop = true;
+                }
 
                 if (m_m6502->BreakpointHit())
+                {
+                    Log("RunToVBlankTemplate: Stopping due to BreakpointHit at PC=0x%04X", m_m6502->GetState()->PC.GetValue());
                     stop = true;
+                }
 
                 if (debug->stop_on_run_to_breakpoint && m_m6502->RunToBreakpointHit())
+                {
+                    Log("RunToVBlankTemplate: Stopping due to RunToBreakpointHit");
                     stop = true;
+                }
             }
         }
         while (!stop);
 
-        //Debug("RunToVBlankTemplate: Exiting after %u cycles", failsafe_cycle_count);
+        bool bp_hit = m_m6502->BreakpointHit();
+        bool rtb_hit = m_m6502->RunToBreakpointHit();
+        // Only log if a breakpoint was hit (to avoid spam)
+        if (bp_hit || rtb_hit)
+        {
+            Log("RunToVBlankTemplate: Exiting with breakpoint! cycles=%u, BreakpointHit=%d, RunToBreakpointHit=%d, PC=0x%04X",
+                  failsafe_cycle_count, bp_hit, rtb_hit, m_m6502->GetState()->PC.GetValue());
+        }
 
         m_audio->EndFrame(sample_buffer, sample_count);
 
-        return m_m6502->BreakpointHit() || m_m6502->RunToBreakpointHit();
+        return bp_hit || rtb_hit;
     }
     else
     {

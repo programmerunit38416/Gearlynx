@@ -27,6 +27,7 @@
 #include "renderer.h"
 #include "emu.h"
 #include "utils.h"
+#include "gdb_interface.h"
 
 #define APPLICATION_IMPORT
 #include "application.h"
@@ -535,7 +536,9 @@ static void sdl_events_app(const SDL_Event* event)
                 }
                 case SDL_WINDOWEVENT_FOCUS_LOST:
                 {
-                    if (config_emulator.pause_when_inactive)
+                    // Don't pause when GDB is actively debugging - we need to keep running
+                    bool gdb_active = g_gdb_interface && g_gdb_interface->IsActive();
+                    if (config_emulator.pause_when_inactive && !gdb_active)
                     {
                         paused_when_focus_lost = emu_is_paused();
                         emu_pause();
@@ -801,7 +804,7 @@ static void sdl_events_emu(const SDL_Event* event)
                     if (pressed)
                         emu_key_pressed(GLYNX_KEY_A);
                     else
-                        emu_key_released(GLYNX_KEY_UP);
+                        emu_key_released(GLYNX_KEY_A);
                 }
                 else if (config_input.gamepad_B == vbtn)
                 {

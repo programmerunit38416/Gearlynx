@@ -19,6 +19,9 @@
 
 #include "gearlynx.h"
 #include "application.h"
+#include "gdb_interface.h"
+#include "emu.h"
+#include <cstdlib>
 
 int main(int argc, char* argv[])
 {
@@ -27,6 +30,7 @@ int main(int argc, char* argv[])
     bool show_usage = false;
     bool force_fullscreen = false;
     bool force_windowed = false;
+    int gdb_port = 0;  // 0 = disabled
     int ret = 0;
 
     for (int i = 1; i < argc; i++)
@@ -53,6 +57,20 @@ int main(int argc, char* argv[])
             else if ((strcmp(argv[i], "-w") == 0) || (strcmp(argv[i], "--windowed") == 0))
             {
                 force_windowed = true;
+            }
+            else if (strncmp(argv[i], "--gdb-port=", 11) == 0)
+            {
+                gdb_port = atoi(argv[i] + 11);
+                if (gdb_port <= 0 || gdb_port > 65535)
+                {
+                    printf("Invalid GDB port: %s\n", argv[i] + 11);
+                    show_usage = true;
+                    ret = -1;
+                }
+            }
+            else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--gdb") == 0)
+            {
+                gdb_port = 1234;  // Default GDB port
             }
             else
             {
@@ -91,6 +109,8 @@ int main(int argc, char* argv[])
         printf("\nOptions:\n");
         printf("  -f, --fullscreen    Start in fullscreen mode\n");
         printf("  -w, --windowed      Start in windowed mode with menu visible\n");
+        printf("  -g, --gdb           Enable GDB server on default port 1234 (with GUI)\n");
+        printf("  --gdb-port=PORT     Enable GDB server on specified port (with GUI)\n");
         printf("  -v, --version       Display version information\n");
         printf("  -h, --help          Display this help message\n");
         return ret;
@@ -99,10 +119,45 @@ int main(int argc, char* argv[])
     if (force_fullscreen && force_windowed)
         force_fullscreen = false;
 
+    // Initialize GUI application
     ret = application_init(rom_file, symbol_file, force_fullscreen, force_windowed);
 
-    if (ret == 0)
-        application_mainloop();
+    if (ret != 0)
+    {
+        application_destroy();
+        return ret;
+    }
+
+    // Start GDB server if requested (runs in background thread with GUI)
+    GDBInterface* gdb = nullptr;
+    if (gdb_port > 0)
+    {
+        // Print connection info BEFORE Init() because Init() blocks on accept()
+        printf("Starting GDB server on port %d...\n", gdb_port);
+        printf("GDB server started. Connect with:\n");
+        printf("  lldb -o \"target create t.elf\" -o \"gdb-remote %d\"\n", gdb_port);
+        fflush(stdout);
+
+        gdb = new GDBInterface();
+        GearlynxCore* core = emu_get_core();
+
+        if (!core || !gdb->Init(core, gdb_port))
+        {
+            printf("Warning: Failed to start GDB server\n");
+            delete gdb;
+            gdb = nullptr;
+        }
+    }
+
+    // Run main loop (with GUI and optional GDB)
+    application_mainloop();
+
+    // Cleanup
+    if (gdb)
+    {
+        gdb->Shutdown();
+        delete gdb;
+    }
 
     application_destroy();
 

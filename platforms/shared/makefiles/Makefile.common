@@ -28,6 +28,10 @@ INCLUDES += -I$(DEPS_DIR)/mINI
 INCLUDES += -I$(DEPS_DIR)/miniz
 INCLUDES += -I$(DEPS_DIR)/nfd
 INCLUDES += -I$(DEPS_DIR)/stb
+INCLUDES += -I$(GDBSTUB_DIR)/include
+
+# GDB stub library
+GDBSTUB_LIB = $(GDBSTUB_DIR)/build/libgdbstub.a
 
 USE_CLANG ?= 0
 ifeq ($(USE_CLANG), 1)
@@ -64,7 +68,7 @@ endif
 
 ifeq ($(UNAME_S), Linux)
     PLATFORM = "Linux"
-    LDFLAGS += -lGL -ldl `sdl2-config --libs`
+    LDFLAGS += -lGL -ldl -lpthread `sdl2-config --libs`
     CPPFLAGS += `sdl2-config --cflags`
     TARGET := $(TARGET_NAME)
 else ifeq ($(UNAME_S), Darwin)
@@ -81,11 +85,21 @@ else
     TARGET := $(TARGET_NAME)
 endif
 
-all: header $(TARGET)
+all: header $(GDBSTUB_LIB) $(TARGET)
 	@echo Build completed: $(TARGET_NAME) \($(BUILD_CONFIG)\) - $(GIT_VERSION) - $(PLATFORM)
 
-$(TARGET): $(OBJECTS)
-	$(CXX) -o $@ $(OBJECTS) $(LDFLAGS)
+ifeq ($(DEBUG), 1)
+GDBSTUB_TARGET = debug
+else
+GDBSTUB_TARGET = all
+endif
+
+$(GDBSTUB_LIB):
+	@echo Building mini-gdbstub library...
+	$(MAKE) -C $(GDBSTUB_DIR) $(GDBSTUB_TARGET)
+
+$(TARGET): $(OBJECTS) $(GDBSTUB_LIB)
+	$(CXX) -o $@ $(OBJECTS) $(GDBSTUB_LIB) $(LDFLAGS)
 
 %.o: %.mm
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
@@ -98,6 +112,7 @@ $(TARGET): $(OBJECTS)
 
 clean:
 	rm -f $(OBJECTS) $(TARGET)
+	$(MAKE) -C $(GDBSTUB_DIR) clean
 
 header:
 	@echo "$$HEADER"

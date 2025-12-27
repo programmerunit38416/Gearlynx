@@ -22,6 +22,8 @@
 #include "gearlynx.h"
 #include "sound_queue.h"
 #include "config.h"
+#include "gdb_interface.h"
+#include "m6502.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #if defined(_WIN32)
@@ -109,8 +111,122 @@ void emu_update(void)
 
     int sampleCount = 0;
 
-    if (config_debug.debug)
+    // Check if GDB is connected
+    bool gdb_active = g_gdb_interface && g_gdb_interface->IsActive();
+
+    // Determine if we should run based on GDB state AND/OR GearLynx debug state
+    bool gdb_wants_run = gdb_active && g_gdb_interface->ShouldRun();
+    bool gearlynx_wants_run = config_debug.debug && (emu_debug_command != Debug_Command_None);
+    bool should_run = gdb_wants_run || gearlynx_wants_run || !config_debug.debug;
+
+    if (gdb_active && config_debug.debug)
     {
+        // Combined GDB + GearLynx debug mode
+        // Both can control execution; breakpoints from both are active
+
+        if (!should_run)
+        {
+            update_debug();
+            return;
+        }
+
+        // Unpause if needed
+        if (core->IsPaused())
+            core->Pause(false);
+
+        bool breakpoint_hit = false;
+        GearlynxCore::GLYNX_Debug_Run debug_run;
+
+        // Step if either GDB or GearLynx requests it
+        bool do_step = g_gdb_interface->ShouldStep() ||
+                       (emu_debug_command == Debug_Command_Step);
+        debug_run.step_debugger = do_step;
+        debug_run.stop_on_breakpoint = true;
+        debug_run.stop_on_run_to_breakpoint = true;
+
+        // Include GearLynx IRQ breakpoints
+        debug_run.stop_on_irq = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            if (emu_debug_irq_breakpoints[i])
+                debug_run.stop_on_irq = SET_BIT(debug_run.stop_on_irq, i);
+        }
+
+        M6502* cpu = core->GetM6502();
+        cpu->EnableBreakpoints(true, 0);
+
+        if (do_step)
+        {
+            cpu->RunInstruction();
+            breakpoint_hit = true;
+        }
+        else
+        {
+            breakpoint_hit = core->RunToVBlank(emu_frame_buffer, audio_buffer, &sampleCount, &debug_run);
+
+            if (!breakpoint_hit && cpu->IsBreakpoint(cpu->GetState()->PC.GetValue()))
+                breakpoint_hit = true;
+        }
+
+        if (breakpoint_hit || emu_debug_command == Debug_Command_StepFrame ||
+            emu_debug_command == Debug_Command_Step)
+        {
+            emu_debug_pc_changed = true;
+        }
+
+        if (breakpoint_hit)
+        {
+            // Signal GDB about the breakpoint
+            g_gdb_interface->SignalBreakpoint();
+            emu_debug_command = Debug_Command_None;
+        }
+
+        if (emu_debug_command != Debug_Command_Continue)
+            emu_debug_command = Debug_Command_None;
+
+        update_debug();
+    }
+    else if (gdb_active)
+    {
+        // GDB-only mode (no GearLynx debug UI)
+        if (!g_gdb_interface->ShouldRun())
+            return;
+
+        if (core->IsPaused())
+            core->Pause(false);
+
+        bool breakpoint_hit = false;
+        GearlynxCore::GLYNX_Debug_Run debug_run;
+        debug_run.step_debugger = g_gdb_interface->ShouldStep();
+        debug_run.stop_on_breakpoint = true;
+        debug_run.stop_on_run_to_breakpoint = true;
+        debug_run.stop_on_irq = 0;
+
+        M6502* cpu = core->GetM6502();
+        cpu->EnableBreakpoints(true, 0);
+
+        if (g_gdb_interface->ShouldStep())
+        {
+            cpu->RunInstruction();
+            breakpoint_hit = true;
+        }
+        else
+        {
+            breakpoint_hit = core->RunToVBlank(emu_frame_buffer, audio_buffer, &sampleCount, &debug_run);
+
+            if (!breakpoint_hit && cpu->IsBreakpoint(cpu->GetState()->PC.GetValue()))
+                breakpoint_hit = true;
+        }
+
+        if (breakpoint_hit)
+        {
+            g_gdb_interface->SignalBreakpoint();
+            emu_debug_pc_changed = true;
+        }
+    }
+    else if (config_debug.debug)
+    {
+        // Original debug mode (no GDB)
         bool breakpoint_hit = false;
         GearlynxCore::GLYNX_Debug_Run debug_run;
         debug_run.step_debugger = (emu_debug_command == Debug_Command_Step);
