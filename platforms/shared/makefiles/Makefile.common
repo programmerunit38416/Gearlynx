@@ -95,6 +95,13 @@ GDBSTUB_TARGET = all
 endif
 
 $(GDBSTUB_LIB):
+	@if [ ! -f $(GDBSTUB_DIR)/Makefile ]; then \
+		echo ""; \
+		echo "ERROR: GDB stub submodule not initialized."; \
+		echo "Run: git submodule update --init --recursive"; \
+		echo ""; \
+		exit 1; \
+	fi
 	@echo Building mini-gdbstub library...
 	$(MAKE) -C $(GDBSTUB_DIR) $(GDBSTUB_TARGET)
 
