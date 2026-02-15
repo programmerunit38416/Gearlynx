@@ -17,7 +17,7 @@
  *
  */
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 
 #define GUI_POPUPS_IMPORT
 #include "gui_popups.h"
@@ -25,10 +25,11 @@
 #include "gui_debug_constants.h"
 #include "config.h"
 #include "application.h"
+#include "gamepad.h"
 #include "emu.h"
 #include "license.h"
 #include "backers.h"
-#include "renderer.h"
+#include "ogl_renderer.h"
 #include "keyboard.h"
 #include "imgui.h"
 #include "implot.h"
@@ -51,7 +52,7 @@ void gui_popup_modal_keyboard(void)
             if (ImGui::IsKeyDown(i))
             {
                 SDL_Keycode key_code = ImGuiKeyToSDLKeycode(i);
-                SDL_Scancode key = SDL_GetScancodeFromKey(key_code);
+                SDL_Scancode key = SDL_GetScancodeFromKey(key_code, NULL);
 
                 if ((key != SDL_SCANCODE_LCTRL) && (key != SDL_SCANCODE_RCTRL) && (key != SDL_SCANCODE_CAPSLOCK))
                 {
@@ -77,9 +78,9 @@ void gui_popup_modal_gamepad(void)
         ImGui::Text("Press any button in your gamepad...\n\n");
         ImGui::Separator();
 
-        for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
+        for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++)
         {
-            if (SDL_GameControllerGetButton(application_gamepad, (SDL_GameControllerButton)i))
+            if (SDL_GetGamepadButton(gamepad_controller, (SDL_GamepadButton)i))
             {
                 *gui_configured_button = i;
                 ImGui::CloseCurrentPopup();
@@ -87,12 +88,12 @@ void gui_popup_modal_gamepad(void)
             }
         }
 
-        for (int a = SDL_CONTROLLER_AXIS_LEFTX; a < SDL_CONTROLLER_AXIS_MAX; a++)
+        for (int a = SDL_GAMEPAD_AXIS_LEFTX; a < SDL_GAMEPAD_AXIS_COUNT; a++)
         {
-            if (a != SDL_CONTROLLER_AXIS_TRIGGERLEFT && a != SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
+            if (a != SDL_GAMEPAD_AXIS_LEFT_TRIGGER && a != SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)
                 continue;
 
-            Sint16 value = SDL_GameControllerGetAxis(application_gamepad, (SDL_GameControllerAxis)a);
+            Sint16 value = SDL_GetGamepadAxis(gamepad_controller, (SDL_GamepadAxis)a);
 
             if (value > GAMEPAD_VBTN_AXIS_THRESHOLD)
             {
@@ -133,7 +134,7 @@ void gui_popup_modal_hotkey()
             if (ImGui::IsKeyPressed(i, false))
             {
                 SDL_Keycode key_code = ImGuiKeyToSDLKeycode(i);
-                SDL_Scancode key = SDL_GetScancodeFromKey(key_code);
+                SDL_Scancode key = SDL_GetScancodeFromKey(key_code, NULL);
 
                 if (key != SDL_SCANCODE_UNKNOWN)
                 {
@@ -236,9 +237,9 @@ void gui_popup_modal_about(void)
                 #if defined(__clang_version__)
                 add_build_info("Clang %s\n", __clang_version__);
                 #endif
-                add_build_info("SDL %d.%d.%d (build)\n", application_sdl_build_version.major, application_sdl_build_version.minor, application_sdl_build_version.patch);
-                add_build_info("SDL %d.%d.%d (link)\n", application_sdl_link_version.major, application_sdl_link_version.minor, application_sdl_link_version.patch);
-                add_build_info("OpenGL %s\n", renderer_opengl_version);
+                add_build_info("SDL %d.%d.%d (build)\n", SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_MICRO_VERSION);
+                add_build_info("SDL %d.%d.%d (link)\n", application_sdl_version_major, application_sdl_version_minor, application_sdl_version_patch);
+                add_build_info("OpenGL %s\n", ogl_renderer_opengl_version);
                 add_build_info("Dear ImGui %s (%d)\n", IMGUI_VERSION, IMGUI_VERSION_NUM);
                 add_build_info("ImPlot %s (%d)\n", IMPLOT_VERSION, IMPLOT_VERSION_NUM);
 
@@ -249,10 +250,10 @@ void gui_popup_modal_about(void)
                 add_build_info("define: NDEBUG\n");
                 #endif
                 #if defined(GLYNX_DEBUG)
-                add_build_info("define: GG_DEBUG\n");
+                add_build_info("define: GLYNX_DEBUG\n");
                 #endif
                 #if defined(GLYNX_NO_OPTIMIZATIONS)
-                add_build_info("define: GG_NO_OPTIMIZATIONS\n");
+                add_build_info("define: GLYNX_NO_OPTIMIZATIONS\n");
                 #endif
                 #if defined(GLYNX_DISABLE_DISASSEMBLER)
                 add_build_info("define: GLYNX_DISABLE_DISASSEMBLER\n");
@@ -267,10 +268,10 @@ void gui_popup_modal_about(void)
                 add_build_info("define: __STDC_VERSION__ = %d\n", (int)__STDC_VERSION__);
                 #endif
                 #if defined(GLYNX_LITTLE_ENDIAN)
-                add_build_info("define: GG_LITTLE_ENDIAN");
+                add_build_info("define: GLYNX_LITTLE_ENDIAN");
                 #endif
                 #if defined(GLYNX_BIG_ENDIAN)
-                add_build_info("define: GG_BIG_ENDIAN");
+                add_build_info("define: GLYNX_BIG_ENDIAN");
                 #endif
 
                 ImGui::InputTextMultiline("##build_info", build_info, sizeof(build_info), ImVec2(-1.0f, 100.0f), ImGuiInputTextFlags_ReadOnly);
@@ -297,15 +298,15 @@ void gui_popup_modal_about(void)
         ImGui::NewLine();
         ImGui::Separator();
 
-        if (application_gamepad)
+        if (gamepad_controller)
             ImGui::Text("> Gamepad detected");
         else
             ImGui::Text("> No gamepad detected");
 
-        if (application_added_gamepad_mappings || application_updated_gamepad_mappings)
+        if (gamepad_added_mappings || gamepad_updated_mappings)
         {
-            ImGui::Text("%d game controller mappings added from gamecontrollerdb.txt", application_added_gamepad_mappings);
-            ImGui::Text("%d game controller mappings updated from gamecontrollerdb.txt", application_updated_gamepad_mappings);
+            ImGui::Text("%d game controller mappings added from gamecontrollerdb.txt", gamepad_added_mappings);
+            ImGui::Text("%d game controller mappings updated from gamecontrollerdb.txt", gamepad_updated_mappings);
         }
         else
             ImGui::Text("ERROR: Game controller database not found (gamecontrollerdb.txt)!!");
@@ -320,6 +321,34 @@ void gui_popup_modal_about(void)
         }
         ImGui::SetItemDefaultFocus();
 
+        ImGui::EndPopup();
+    }
+}
+
+void gui_popup_modal_load_defaults(void)
+{
+    if (ImGui::BeginPopupModal("Load Default Settings", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("Are you sure you want to load default settings?\n\n");
+        ImGui::Text("This action cannot be reverted.\n\n");
+        ImGui::Separator();
+
+        if (ImGui::Button("Yes", ImVec2(120, 0)))
+        {
+            config_load_defaults();
+            ImGui::CloseCurrentPopup();
+            gui_dialog_in_use = false;
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("No", ImVec2(120, 0)))
+        {
+            ImGui::CloseCurrentPopup();
+            gui_dialog_in_use = false;
+        }
+
+        ImGui::SetItemDefaultFocus();
         ImGui::EndPopup();
     }
 }
@@ -409,7 +438,7 @@ static void check_hotkey_duplicates_popup(config_Hotkey* current_hotkey)
             other->mod == current_hotkey->mod)
         {
             other->key = SDL_SCANCODE_UNKNOWN;
-            other->mod = KMOD_NONE;
+            other->mod = SDL_KMOD_NONE;
             config_update_hotkey_string(other);
         }
     }

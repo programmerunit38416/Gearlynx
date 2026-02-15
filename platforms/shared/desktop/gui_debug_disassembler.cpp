@@ -31,20 +31,16 @@
 #include "config.h"
 #include "emu.h"
 
-struct DebugSymbol
-{
-    u16 address;
-    char text[64];
-};
-
 struct DisassemblerLine
 {
     u16 address;
     bool is_breakpoint;
     GLYNX_Disassembler_Record* record;
     char name_enhanced[64];
+    char tooltip[128];
     int name_real_length;
     DebugSymbol* symbol;
+    bool is_auto_symbol;
 };
 
 struct DisassemblerBookmark
@@ -53,8 +49,18 @@ struct DisassemblerBookmark
     char name[32];
 };
 
+struct SymbolEntry
+{
+    DebugSymbol* symbol;
+    bool is_fixed;
+};
+
+static bool symbols_dirty = true;
+static bool show_auto_symbols = false;
 static DebugSymbol** fixed_symbols = NULL;
 static DebugSymbol** dynamic_symbols = NULL;
+static std::vector<SymbolEntry> fixed_symbol_list;
+static std::vector<SymbolEntry> dynamic_symbol_list;
 static std::vector<DisassemblerLine> disassembler_lines(0x10000);
 static std::vector<DisassemblerBookmark> bookmarks;
 static int selected_address = -1;
@@ -75,6 +81,7 @@ static bool add_symbol_open = false;
 
 static void draw_controls(void);
 static void draw_breakpoints(void);
+static void draw_breakpoints_content(void);
 static void prepare_drawable_lines(void);
 static void draw_disassembly(void);
 static void draw_context_menu(DisassemblerLine* line);
@@ -83,7 +90,7 @@ static void add_auto_symbol(GLYNX_Disassembler_Record* record, u16 address);
 static void add_breakpoint();
 static void request_goto_address(u16 addr);
 static bool is_return_instruction(u8 opcode);
-static void replace_symbols(DisassemblerLine* line, const char* color);
+static void replace_symbols(DisassemblerLine* line, const char* jump_color, const char* operand_color, const char* auto_color, const char* original_color);
 static void replace_labels(DisassemblerLine* line, const char* color, const char* original_color);
 static void draw_instruction_name(DisassemblerLine* line, bool is_pc);
 static void disassembler_menu(void);
@@ -91,6 +98,10 @@ static void add_bookmark_popup(void);
 static void add_symbol_popup(void);
 static void save_full_disassembler(FILE* file);
 static void save_current_disassembler(FILE* file);
+static bool symbol_sort_address_asc(const SymbolEntry& a, const SymbolEntry& b);
+static bool symbol_sort_address_desc(const SymbolEntry& a, const SymbolEntry& b);
+static bool symbol_sort_name_asc(const SymbolEntry& a, const SymbolEntry& b);
+static bool symbol_sort_name_desc(const SymbolEntry& a, const SymbolEntry& b);
 
 void gui_debug_disassembler_init(void)
 {
@@ -128,6 +139,10 @@ void gui_debug_reset_symbols(void)
         SafeDelete(fixed_symbols[i]);
         SafeDelete(dynamic_symbols[i]);
     }
+
+    fixed_symbol_list.clear();
+    dynamic_symbol_list.clear();
+    symbols_dirty = true;
 }
 
 void gui_debug_reset_breakpoints(void)
@@ -136,6 +151,11 @@ void gui_debug_reset_breakpoints(void)
     new_breakpoint_buffer[0] = 0;
     for (int i = 0; i < 8; i++)
         emu_debug_irq_breakpoints[i] = false;
+}
+
+void gui_debug_reset_disassembler_bookmarks(void)
+{
+    bookmarks.clear();
 }
 
 void gui_debug_load_symbols_file(const char* file_path)
@@ -252,7 +272,7 @@ void gui_debug_window_disassembler(void)
 {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
     ImGui::SetNextWindowPos(ImVec2(170, 26), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(406, 562), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(426, 564), ImGuiCond_FirstUseEver);
 
     ImGui::Begin("Disassembler", &config_debug.show_disassembler, ImGuiWindowFlags_MenuBar);
 
@@ -371,131 +391,168 @@ static void draw_controls(void)
     }
 
     ImGui::PopFont();
+
+    ImGui::SameLine();
+    ImGui::TextColored(emu_is_debug_idle() ? red : green, emu_is_debug_idle() ? "   PAUSED" : "   RUNNING");
+}
+
+static void draw_breakpoints_content(void)
+{
+    ImGui::Checkbox("Disable All##disable_mem", &emu_debug_disable_breakpoints); ImGui::SameLine();
+
+    if (ImGui::Button("Remove All##clear_all", ImVec2(85, 0)))
+    {
+        gui_debug_reset_breakpoints();
+    }
+
+    ImGui::Separator();
+
+    for (int i = 0; i < 8; i++)
+    {
+        char irq[32];
+        snprintf(irq, 32, "IRQ %d   ", i);
+        ImGui::Checkbox(irq, &emu_debug_irq_breakpoints[i]);
+        if (i != 3 && i != 7)
+            ImGui::SameLine();
+    }
+
+    ImGui::Columns(2, "breakpoints");
+    ImGui::SetColumnOffset(1, 130);
+
+    ImGui::Separator();
+
+    ImGui::PushItemWidth(85);
+    if (ImGui::InputTextWithHint("##add_breakpoint", "XXXX-XXXX", new_breakpoint_buffer, IM_ARRAYSIZE(new_breakpoint_buffer), ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue))
+    {
+        add_breakpoint();
+    }
+    ImGui::PopItemWidth();
+
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Use hex XXXX format for single addresses or XXXX-XXXX for address ranges");
+
+    ImGui::Checkbox("Read", &new_breakpoint_read);
+    ImGui::Checkbox("Write", &new_breakpoint_write);
+    ImGui::Checkbox("Execute", &new_breakpoint_execute);
+
+    if (ImGui::Button("Add##add", ImVec2(85, 0)))
+    {
+        add_breakpoint();
+    }
+
+    ImGui::NextColumn();
+
+    ImGui::BeginChild("breakpoints", ImVec2(0, 130), false);
+    ImGui::PushFont(gui_default_font);
+
+    int remove = -1;
+    std::vector<M6502::GLYNX_Breakpoint>* breakpoints = emu_get_core()->GetM6502()->GetBreakpoints();
+
+    for (long unsigned int b = 0; b < breakpoints->size(); b++)
+    {
+        M6502::GLYNX_Breakpoint* brk = &(*breakpoints)[b];
+
+        ImGui::PushID(10000 + b);
+        if (ImGui::SmallButton("X"))
+        {
+           remove = b;
+           ImGui::PopID();
+           continue;
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::BeginTooltip();
+            ImGui::Text("Remove breakpoint");
+            ImGui::EndTooltip();
+        }
+
+        ImGui::PopID();
+
+        ImGui::SameLine();
+
+        ImGui::PushID(20000 + b);
+        if (ImGui::SmallButton(brk->enabled ? "-" : "+"))
+        {
+            brk->enabled = !brk->enabled;
+        }
+        ImGui::PopID();
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::BeginTooltip();
+            ImGui::Text(brk->enabled ? "Disable breakpoint" : "Enable breakpoint");
+            ImGui::EndTooltip();
+        }
+
+        ImGui::SameLine();
+
+        if ((*breakpoints)[b].range)
+            ImGui::TextColored(brk->enabled ? cyan : gray, "%04X-%04X", brk->address1, brk->address2);
+        else
+            ImGui::TextColored(brk->enabled ? cyan : gray, "%04X", brk->address1);
+
+        ImGui::SameLine(0, 0); ImGui::TextColored(brk->enabled && brk->read ? orange : gray, " R");
+        ImGui::SameLine(0, 2); ImGui::TextColored(brk->enabled && brk->write ? orange : gray, "W");
+
+        ImGui::SameLine(0, 2); ImGui::TextColored(brk->enabled && brk->execute ? orange : gray, "X");
+
+        GLYNX_Disassembler_Record* record = emu_get_core()->GetMemory()->GetDisassemblerRecord(brk->address1);
+
+        bool symbol_shown = false;
+
+        if (!brk->range && IsValidPointer(record))
+        {
+            DebugSymbol* symbol = fixed_symbols[brk->address1];
+            if (!IsValidPointer(symbol))
+                symbol = dynamic_symbols[brk->address1];
+            if (IsValidPointer(symbol))
+            {
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(brk->enabled ? green : gray, " %s", symbol->text);
+                symbol_shown = true;
+            }
+        }
+
+        if (!symbol_shown && brk->execute && IsValidPointer(record))
+        {
+            ImGui::SameLine(0, 0);
+            ImGui::PushStyleColor(ImGuiCol_Text, brk->enabled ? white : gray);
+            TextColoredEx(" %s", record->name);
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::PopFont();
+
+    if (remove >= 0)
+    {
+        breakpoints->erase(breakpoints->begin() + remove);
+    }
+
+    ImGui::EndChild();
+    ImGui::Columns(1);
+    ImGui::Separator();
 }
 
 static void draw_breakpoints(void)
 {
     if (ImGui::CollapsingHeader("Breakpoints"))
     {
-        ImGui::Checkbox("Disable All##disable_mem", &emu_debug_disable_breakpoints); ImGui::SameLine();
-
-        if (ImGui::Button("Remove All##clear_all", ImVec2(85, 0)))
-        {
-            gui_debug_reset_breakpoints();
-        }
-
-        ImGui::Separator();
-
-        for (int i = 0; i < 8; i++)
-        {
-            char irq[32];
-            snprintf(irq, 32, "IRQ %d   ", i);
-            ImGui::Checkbox(irq, &emu_debug_irq_breakpoints[i]);
-            if (i != 3 && i != 7)
-                ImGui::SameLine();
-        }
-
-        ImGui::Columns(2, "breakpoints");
-        ImGui::SetColumnOffset(1, 130);
-
-        ImGui::Separator();
-
-        ImGui::PushItemWidth(85);
-        if (ImGui::InputTextWithHint("##add_breakpoint", "XXXX-XXXX", new_breakpoint_buffer, IM_ARRAYSIZE(new_breakpoint_buffer), ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue))
-        {
-            add_breakpoint();
-        }
-        ImGui::PopItemWidth();
-
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Use hex XXXX format for single addresses or XXXX-XXXX for address ranges");
-
-        ImGui::Checkbox("Read", &new_breakpoint_read);
-        ImGui::Checkbox("Write", &new_breakpoint_write);
-        ImGui::Checkbox("Execute", &new_breakpoint_execute);
-
-        if (ImGui::Button("Add##add", ImVec2(85, 0)))
-        {
-            add_breakpoint();
-        }
-
-        ImGui::NextColumn();
-
-        ImGui::BeginChild("breakpoints", ImVec2(0, 130), false);
-        ImGui::PushFont(gui_default_font);
-
-        int remove = -1;
-        std::vector<M6502::GLYNX_Breakpoint>* breakpoints = emu_get_core()->GetM6502()->GetBreakpoints();
-
-        for (long unsigned int b = 0; b < breakpoints->size(); b++)
-        {
-            M6502::GLYNX_Breakpoint* brk = &(*breakpoints)[b];
-
-            ImGui::PushID(10000 + b);
-            if (ImGui::SmallButton("X"))
-            {
-               remove = b;
-               ImGui::PopID();
-               continue;
-            }
-            if (ImGui::IsItemHovered())
-            {
-                ImGui::BeginTooltip();
-                ImGui::Text("Remove breakpoint");
-                ImGui::EndTooltip();
-            }
-
-            ImGui::PopID();
-
-            ImGui::SameLine();
-
-            ImGui::PushID(20000 + b);
-            if (ImGui::SmallButton(brk->enabled ? "-" : "+"))
-            {
-                brk->enabled = !brk->enabled;
-            }
-            ImGui::PopID();
-            if (ImGui::IsItemHovered())
-            {
-                ImGui::BeginTooltip();
-                ImGui::Text(brk->enabled ? "Disable breakpoint" : "Enable breakpoint");
-                ImGui::EndTooltip();
-            }
-
-            ImGui::SameLine();
-
-            if ((*breakpoints)[b].range)
-                ImGui::TextColored(brk->enabled ? cyan : gray, "%04X-%04X", brk->address1, brk->address2);
-            else
-                ImGui::TextColored(brk->enabled ? cyan : gray, "%04X", brk->address1);
-
-            ImGui::SameLine(); ImGui::TextColored(brk->enabled && brk->read ? orange : gray, " R");
-            ImGui::SameLine(0, 2); ImGui::TextColored(brk->enabled && brk->write ? orange : gray, "W");
-
-            ImGui::SameLine(0, 2); ImGui::TextColored(brk->enabled && brk->execute ? orange : gray, "X");
-
-            GLYNX_Disassembler_Record* record = emu_get_core()->GetMemory()->GetDisassemblerRecord(brk->address1);
-
-            if (brk->execute && IsValidPointer(record))
-            {
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, brk->enabled ? white : gray);
-                TextColoredEx(" %s", record->name);
-                ImGui::PopStyleColor();
-            }
-        }
-
-        ImGui::PopFont();
-
-        if (remove >= 0)
-        {
-            breakpoints->erase(breakpoints->begin() + remove);
-        }
-
-        ImGui::EndChild();
-        ImGui::Columns(1);
-        ImGui::Separator();
+        draw_breakpoints_content();
     }
+}
+
+void gui_debug_window_breakpoints(void)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::SetNextWindowPos(ImVec2(340, 26), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(408, 264), ImGuiCond_FirstUseEver);
+
+    ImGui::Begin("Breakpoints", &config_debug.show_breakpoints);
+
+    draw_breakpoints_content();
+
+    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 static void prepare_drawable_lines(void)
@@ -544,6 +601,7 @@ static void prepare_drawable_lines(void)
                     DisassemblerLine line;
                     line.address = (u16)i;
                     line.symbol = symbol;
+                    line.is_auto_symbol = false;
                     disassembler_lines.push_back(line);
                     fixed_symbol_found = true;
                 }
@@ -558,6 +616,7 @@ static void prepare_drawable_lines(void)
                     DisassemblerLine line;
                     line.address = (u16)i;
                     line.symbol = symbol;
+                    line.is_auto_symbol = true;
                     disassembler_lines.push_back(line);
                 }
             }
@@ -568,6 +627,7 @@ static void prepare_drawable_lines(void)
             line.is_breakpoint = false;
             line.record = record;
             snprintf(line.name_enhanced, 64, "%s", line.record->name);
+            line.tooltip[0] = 0;
 
             std::vector<M6502::GLYNX_Breakpoint>* breakpoints = emu_get_core()->GetM6502()->GetBreakpoints();
 
@@ -644,7 +704,8 @@ static void draw_disassembly(void)
 
                 if (line.symbol)
                 {
-                    ImGui::TextColored(green, "%s:", line.symbol->text);
+                    bool dim = line.is_auto_symbol && config_debug.dis_dim_auto_symbols;
+                    ImGui::TextColored(dim ? dim_green : green, "%s:", line.symbol->text);
                     continue;
                 }
 
@@ -724,6 +785,13 @@ static void draw_disassembly(void)
 
                 ImGui::SameLine();
                 draw_instruction_name(&line, line.address == pc);
+
+                if (line.tooltip[0] != 0 && ImGui::IsItemHovered())
+                {
+                    ImGui::BeginTooltip();
+                    TextColoredEx("%s", line.tooltip);
+                    ImGui::EndTooltip();
+                }
 
                 if (config_debug.dis_show_mem)
                 {
@@ -903,11 +971,31 @@ static void add_symbol(const char* line)
             snprintf(s.text, 64, "%s", symbol.c_str());
 
             // Store the symbol
+            DebugSymbol* existing = fixed_symbols[s.address];
+            if (IsValidPointer(existing))
+            {
+                for (size_t i = 0; i < fixed_symbol_list.size(); i++)
+                {
+                    if (fixed_symbol_list[i].symbol == existing)
+                    {
+                        fixed_symbol_list.erase(fixed_symbol_list.begin() + i);
+                        break;
+                    }
+                }
+                SafeDelete(fixed_symbols[s.address]);
+            }
+
             DebugSymbol* new_symbol = new DebugSymbol;
             new_symbol->address = s.address;
             snprintf(new_symbol->text, 64, "%s", s.text);
 
             fixed_symbols[s.address] = new_symbol;
+
+            SymbolEntry entry;
+            entry.symbol = new_symbol;
+            entry.is_fixed = true;
+            fixed_symbol_list.push_back(entry);
+            symbols_dirty = true;
         }
     }
 }
@@ -948,6 +1036,8 @@ static void add_auto_symbol(GLYNX_Disassembler_Record* record, u16 address)
         {
            if (record->subroutine)
                snprintf(dynamic_symbols[s.address]->text, 64, "SUB_%04X", record->jump_address);
+           if (show_auto_symbols)
+               symbols_dirty = true;
         }
         else
         {
@@ -956,6 +1046,14 @@ static void add_auto_symbol(GLYNX_Disassembler_Record* record, u16 address)
             snprintf(new_symbol->text, 64, "%s", s.text);
 
             dynamic_symbols[s.address] = new_symbol;
+
+            SymbolEntry entry;
+            entry.symbol = new_symbol;
+            entry.is_fixed = false;
+            dynamic_symbol_list.push_back(entry);
+
+            if (show_auto_symbols)
+                symbols_dirty = true;
         }
     }
 }
@@ -988,62 +1086,151 @@ static bool is_return_instruction(u8 opcode)
     }
 }
 
-static void replace_symbols(DisassemblerLine* line, const char* color)
+static bool replace_address_in_string(std::string& instr, u16 address, bool is_zp, const char* replacement_text)
 {
-    bool symbol_found = false;
+    const char* format = is_zp ? "$%02X" : "$%04X";
+    const char* indirect_format = is_zp ? "$(%02X" : "$(%04X";
+    int replace_len = is_zp ? 3 : 5;
+    int indirect_replace_len = is_zp ? 4 : 6;
 
-    DebugSymbol* fixed_symbol = fixed_symbols[line->record->jump_address];
-
-    if (IsValidPointer(fixed_symbol))
+    char address_str[8];
+    snprintf(address_str, 8, format, address);
+    size_t pos = instr.find(address_str);
+    if (pos != std::string::npos)
     {
-        std::string instr = line->record->name;
-        std::string symbol = fixed_symbol->text;
-        char jump_address[6];
-        snprintf(jump_address, 6, "$%04X", line->record->jump_address);
-        size_t pos = instr.find(jump_address);
-        if (pos != std::string::npos)
+        instr.replace(pos, replace_len, replacement_text);
+        return true;
+    }
+
+    snprintf(address_str, 8, indirect_format, address);
+    pos = instr.find(address_str);
+    if (pos != std::string::npos)
+    {
+        std::string indirect_replacement = std::string("(") + replacement_text;
+        instr.replace(pos, indirect_replace_len, indirect_replacement);
+        return true;
+    }
+
+    return false;
+}
+
+static bool get_record_operand(GLYNX_Disassembler_Record* record, u16* out_address, bool* out_is_zp)
+{
+    if (record->jump)
+    {
+        *out_address = record->jump_address;
+        *out_is_zp = false;
+        return true;
+    }
+    else if (record->has_operand_address)
+    {
+        *out_address = record->operand_address;
+        *out_is_zp = record->operand_is_zp;
+        return true;
+    }
+    return false;
+}
+
+bool gui_debug_resolve_symbol(GLYNX_Disassembler_Record* record, std::string& instr, const char* color, const char* original_color, const char** out_name, u16* out_address)
+{
+    u16 lookup_address = 0;
+    bool is_zp = false;
+
+    if (!get_record_operand(record, &lookup_address, &is_zp))
+        return false;
+
+    DebugSymbol* symbol = fixed_symbols[lookup_address];
+    if (IsValidPointer(symbol))
+    {
+        std::string replacement = std::string(color) + symbol->text + original_color;
+        if (replace_address_in_string(instr, lookup_address, is_zp, replacement.c_str()))
         {
-            instr.replace(pos, 5, color + symbol);
-            snprintf(line->name_enhanced, 64, "%s", instr.c_str());
-            symbol_found = true;
+            if (out_name) *out_name = symbol->text;
+            if (out_address) *out_address = lookup_address;
+            return true;
         }
     }
 
-    if (symbol_found)
+    return false;
+}
+
+bool gui_debug_resolve_label(GLYNX_Disassembler_Record* record, std::string& instr, const char* color, const char* original_color, const char** out_name, u16* out_address)
+{
+    u16 lookup_address = 0;
+    bool is_zp = false;
+
+    if (get_record_operand(record, &lookup_address, &is_zp))
+    {
+        for (int i = 0; i < k_debug_label_count; i++)
+        {
+            if (k_debug_labels[i].address == lookup_address)
+            {
+                char label_address[6];
+                snprintf(label_address, 6, "$%04X", lookup_address);
+                std::string replacement = std::string(color) + k_debug_labels[i].label + "_" + label_address + original_color;
+                if (replace_address_in_string(instr, lookup_address, is_zp, replacement.c_str()))
+                {
+                    if (out_name) *out_name = k_debug_labels[i].label;
+                    if (out_address) *out_address = lookup_address;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void replace_symbols(DisassemblerLine* line, const char* jump_color, const char* operand_color, const char* auto_color, const char* original_color)
+{
+    std::string instr = line->record->name;
+    const char* color = line->record->jump ? jump_color : operand_color;
+    const char* resolved_name = NULL;
+    u16 resolved_address = 0;
+
+    if (gui_debug_resolve_symbol(line->record, instr, color, original_color, &resolved_name, &resolved_address))
+    {
+        snprintf(line->name_enhanced, 64, "%s", instr.c_str());
+        snprintf(line->tooltip, 128, "%s%s%s = %s$%04X", color, resolved_name, c_white, c_cyan, resolved_address);
+        return;
+    }
+
+    if (!config_debug.dis_show_auto_symbols)
         return;
 
-    DebugSymbol* dynamic_symbol = dynamic_symbols[line->record->jump_address];
+    if (!line->record->jump)
+        return;
+
+    u16 lookup_address = 0;
+    bool is_zp = false;
+
+    if (!get_record_operand(line->record, &lookup_address, &is_zp))
+        return;
+
+    DebugSymbol* dynamic_symbol = dynamic_symbols[lookup_address];
 
     if (IsValidPointer(dynamic_symbol))
     {
-        std::string instr = line->record->name;
-        std::string symbol = dynamic_symbol->text;
-        char jump_address[6];
-        snprintf(jump_address, 6, "$%04X", line->record->jump_address);
-        size_t pos = instr.find(jump_address);
-        if (pos != std::string::npos)
+        std::string replacement = std::string(auto_color) + dynamic_symbol->text + original_color;
+        if (replace_address_in_string(instr, lookup_address, is_zp, replacement.c_str()))
         {
-            instr.replace(pos, 5, color + symbol);
             snprintf(line->name_enhanced, 64, "%s", instr.c_str());
+            snprintf(line->tooltip, 128, "%s%s%s = %s$%04X", auto_color, dynamic_symbol->text, c_white, c_cyan, lookup_address);
         }
-
     }
 }
 
 static void replace_labels(DisassemblerLine* line, const char* color, const char* original_color)
 {
-    for (int i = 0; i < k_debug_label_count; i++)
+    std::string instr = line->record->name;
+    const char* resolved_name = NULL;
+    u16 resolved_address = 0;
+
+    if (gui_debug_resolve_label(line->record, instr, color, original_color, &resolved_name, &resolved_address))
     {
-        std::string instr = line->record->name;
-        std::string label = k_debug_labels[i].label;
-        char label_address[6];
-        snprintf(label_address, 6, "$%04X", k_debug_labels[i].address);
-        size_t pos = instr.find(label_address);
-        if (pos != std::string::npos)
-        {
-            instr.replace(pos, 5, color + label + "_" + label_address + original_color);
-            snprintf(line->name_enhanced, 64, "%s", instr.c_str());
-        }
+        snprintf(line->name_enhanced, 64, "%s", instr.c_str());
+        if (line->tooltip[0] == 0)
+            snprintf(line->tooltip, 128, "%s%s%s = %s$%04X", color, resolved_name, c_white, c_cyan, resolved_address);
     }
 }
 
@@ -1080,9 +1267,10 @@ static void draw_instruction_name(DisassemblerLine* line, bool is_pc)
         extra_color = c_blue;
     }
 
-    if (config_debug.dis_replace_symbols && line->record->jump)
+    if (config_debug.dis_replace_symbols)
     {
-        replace_symbols(line, symbol_color);
+        const char* auto_symbol_color = config_debug.dis_dim_auto_symbols ? c_dim_green : symbol_color;
+        replace_symbols(line, symbol_color, label_color, auto_symbol_color, operands_color);
     }
 
     if (config_debug.dis_replace_labels)
@@ -1101,7 +1289,9 @@ static void draw_instruction_name(DisassemblerLine* line, bool is_pc)
     if (pos != std::string::npos)
         instr.replace(pos, 3, operands_color);
 
+    ImGui::BeginGroup();
     line->name_real_length = TextColoredEx("%s%s", name_color, instr.c_str());
+    ImGui::EndGroup();
 }
 
 static void disassembler_menu(void)
@@ -1128,6 +1318,17 @@ static void disassembler_menu(void)
         ImGui::MenuItem("Opcodes", NULL, &config_debug.dis_show_mem);
         ImGui::MenuItem("Symbols", NULL, &config_debug.dis_show_symbols);
         ImGui::MenuItem("Segment", NULL, &config_debug.dis_show_segment);
+
+        ImGui::Separator();
+
+        if (ImGui::BeginMenu("Run Ahead"))
+        {
+            ImGui::PushItemWidth(200.0f);
+            ImGui::SliderInt("##lookahead", &config_debug.dis_look_ahead_count, 0, 100, "%d instructions");
+            ImGui::PopItemWidth();
+            ImGui::EndMenu();
+        }
+
         ImGui::EndMenu();
     }
 
@@ -1136,6 +1337,14 @@ static void disassembler_menu(void)
         if (ImGui::MenuItem("Back", config_hotkeys[config_HotkeyIndex_DebugGoBack].str))
         {
             gui_debug_go_back();
+        }
+
+        if (ImGui::MenuItem("Go To PC"))
+        {
+            M6502* processor = emu_get_core()->GetM6502();
+            M6502::M6502_State* proc_state = processor->GetState();
+            u16 pc = proc_state->PC.GetValue();
+            request_goto_address(pc);
         }
 
         if (ImGui::BeginMenu("Go To Address..."))
@@ -1212,6 +1421,10 @@ static void disassembler_menu(void)
 
         ImGui::Separator();
 
+        ImGui::MenuItem("Skip IRQs on Step Into", NULL, &config_debug.step_skip_interrupts);
+
+        ImGui::Separator();
+
         if (ImGui::BeginMenu("Run To Address..."))
         {
             bool go = false;
@@ -1242,6 +1455,10 @@ static void disassembler_menu(void)
 
     if (ImGui::BeginMenu("Breakpoints"))
     {
+        ImGui::MenuItem("Breakpoints Window", NULL, &config_debug.show_breakpoints);
+
+        ImGui::Separator();
+
         if (ImGui::MenuItem("Toggle Selected Line", config_hotkeys[config_HotkeyIndex_DebugBreakpoint].str))
         {
             gui_debug_toggle_breakpoint();
@@ -1304,9 +1521,16 @@ static void disassembler_menu(void)
 
     if (ImGui::BeginMenu("Symbols"))
     {
+        ImGui::MenuItem("Symbols Window", NULL, &config_debug.show_symbols);
+
+        ImGui::Separator();
+        ImGui::MenuItem("Hardware Labels", NULL, &config_debug.dis_replace_labels);
+
         ImGui::MenuItem("Automatic Symbols", NULL, &config_debug.dis_show_auto_symbols);
+        if (!config_debug.dis_show_auto_symbols) ImGui::BeginDisabled();
+        ImGui::MenuItem("Dim Automatic Symbols", NULL, &config_debug.dis_dim_auto_symbols);
+        if (!config_debug.dis_show_auto_symbols) ImGui::EndDisabled();
         ImGui::MenuItem("Replace Address With Symbol", NULL, &config_debug.dis_replace_symbols);
-        ImGui::MenuItem("Replace Address With Label", NULL, &config_debug.dis_replace_labels);
 
         ImGui::Separator();
 
@@ -1499,6 +1723,7 @@ void gui_debug_window_call_stack(void)
 
         ImGui::PushFont(gui_default_font);
 
+        int row_index = 0;
         while (!temp_stack.empty())
         {
             ImGui::TableNextRow();
@@ -1526,15 +1751,43 @@ void gui_debug_window_call_stack(void)
             }
 
             ImGui::TableNextColumn();
-            ImGui::TextColored(cyan, "$%04X", entry.dest);
+            char selectable_id[16];
+            snprintf(selectable_id, sizeof(selectable_id), "##cs%d", row_index);
+            if (ImGui::Selectable(selectable_id, false, ImGuiSelectableFlags_SpanAllColumns))
+            {
+                request_goto_address(entry.dest);
+            }
+
+            ImGui::PopFont();
+            if (ImGui::BeginPopupContextItem())
+            {
+                if (ImGui::Selectable("Add Breakpoint"))
+                {
+                    if (!emu_get_core()->GetM6502()->IsBreakpoint(entry.dest))
+                        emu_get_core()->GetM6502()->AddBreakpoint(entry.dest);
+                }
+
+                if (ImGui::Selectable("Add Watch..."))
+                {
+                    gui_debug_memory_open_watch_popup(0, entry.dest, symbol_text[0] ? symbol_text : NULL);
+                }
+
+                ImGui::EndPopup();
+            }
+            ImGui::PushFont(gui_default_font);
+
+            ImGui::SameLine(0, 0);
+            ImGui::TextColored(cyan, "%04X", entry.dest);
             ImGui::SameLine();
-            ImGui::TextColored(green, "%s", symbol_text);
+            ImGui::TextColored(green, " %s", symbol_text);
 
             ImGui::TableNextColumn();
-            ImGui::TextColored(cyan, "$%04X", entry.src);
+            ImGui::TextColored(cyan, "%04X", entry.src);
 
             ImGui::TableNextColumn();
-            ImGui::TextColored(cyan, "$%04X", entry.back);
+            ImGui::TextColored(cyan, "%04X", entry.back);
+
+            row_index++;
         }
 
         ImGui::TableNextRow();
@@ -1552,6 +1805,274 @@ void gui_debug_window_call_stack(void)
 
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+void gui_debug_window_symbols(void)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+    ImGui::SetNextWindowPos(ImVec2(340, 400), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 370), ImGuiCond_FirstUseEver);
+
+    ImGui::Begin("Symbols", &config_debug.show_symbols);
+
+    static char symbol_filter[64] = "";
+    static std::vector<SymbolEntry> sorted_symbols;
+    static int last_sort_column = -1;
+    static int last_sort_direction = -1;
+
+    bool prev_auto = show_auto_symbols;
+    ImGui::Checkbox("Automatic Symbols", &show_auto_symbols);
+    if (show_auto_symbols != prev_auto)
+        symbols_dirty = true;
+    ImGui::SameLine();
+    ImGui::PushItemWidth(-1);
+    if (ImGui::InputTextWithHint("##symbol_filter", "Filter...", symbol_filter, IM_ARRAYSIZE(symbol_filter)))
+        symbols_dirty = true;
+    ImGui::PopItemWidth();
+
+    ImGui::Separator();
+
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable;
+
+    if (ImGui::BeginTable("symbols_table", 3, flags))
+    {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort, 68.0f);
+        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 48.0f);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs())
+        {
+            if (sort_specs->SpecsDirty || symbols_dirty)
+            {
+                sort_specs->SpecsDirty = false;
+                symbols_dirty = true;
+            }
+
+            if (sort_specs->SpecsCount > 0)
+            {
+                last_sort_column = sort_specs->Specs[0].ColumnIndex;
+                last_sort_direction = sort_specs->Specs[0].SortDirection;
+            }
+        }
+
+        if (symbols_dirty)
+        {
+            symbols_dirty = false;
+            sorted_symbols.clear();
+
+            for (size_t i = 0; i < fixed_symbol_list.size(); i++)
+            {
+                SymbolEntry& e = fixed_symbol_list[i];
+
+                if (symbol_filter[0] != 0)
+                {
+                    char addr_str[8];
+                    snprintf(addr_str, sizeof(addr_str), "%04X", e.symbol->address);
+
+                    char filter_upper[64];
+                    char text_upper[64];
+                    for (int j = 0; j < 63 && symbol_filter[j]; j++) { filter_upper[j] = toupper(symbol_filter[j]); filter_upper[j + 1] = 0; }
+                    for (int j = 0; j < 63 && e.symbol->text[j]; j++) { text_upper[j] = toupper(e.symbol->text[j]); text_upper[j + 1] = 0; }
+
+                    if (strstr(text_upper, filter_upper) == NULL && strstr(addr_str, filter_upper) == NULL)
+                        continue;
+                }
+
+                sorted_symbols.push_back(e);
+            }
+
+            if (show_auto_symbols)
+            {
+                for (size_t i = 0; i < dynamic_symbol_list.size(); i++)
+                {
+                    SymbolEntry& e = dynamic_symbol_list[i];
+
+                    if (IsValidPointer(fixed_symbols[e.symbol->address]))
+                        continue;
+
+                    if (symbol_filter[0] != 0)
+                    {
+                        char addr_str[8];
+                        snprintf(addr_str, sizeof(addr_str), "%04X", e.symbol->address);
+
+                        char filter_upper[64];
+                        char text_upper[64];
+                        for (int j = 0; j < 63 && symbol_filter[j]; j++) { filter_upper[j] = toupper(symbol_filter[j]); filter_upper[j + 1] = 0; }
+                        for (int j = 0; j < 63 && e.symbol->text[j]; j++) { text_upper[j] = toupper(e.symbol->text[j]); text_upper[j + 1] = 0; }
+
+                        if (strstr(text_upper, filter_upper) == NULL && strstr(addr_str, filter_upper) == NULL)
+                            continue;
+                    }
+
+                    sorted_symbols.push_back(e);
+                }
+            }
+
+            if (last_sort_column >= 0)
+            {
+                bool ascending = (last_sort_direction == ImGuiSortDirection_Ascending);
+
+                if (last_sort_column == 0)
+                {
+                    std::sort(sorted_symbols.begin(), sorted_symbols.end(), ascending ? symbol_sort_address_asc : symbol_sort_address_desc);
+                }
+                else if (last_sort_column == 1)
+                {
+                    std::sort(sorted_symbols.begin(), sorted_symbols.end(), ascending ? symbol_sort_name_asc : symbol_sort_name_desc);
+                }
+            }
+        }
+
+        ImGui::PushFont(gui_default_font);
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)sorted_symbols.size());
+        while (clipper.Step())
+        {
+            for (int idx = clipper.DisplayStart; idx < clipper.DisplayEnd; idx++)
+            {
+                DebugSymbol* symbol = sorted_symbols[idx].symbol;
+                bool is_fixed = sorted_symbols[idx].is_fixed;
+
+                ImGui::TableNextRow();
+
+                ImGui::TableNextColumn();
+                char selectable_id[16];
+                snprintf(selectable_id, sizeof(selectable_id), "##sym%d", (int)idx);
+                if (ImGui::Selectable(selectable_id, false, ImGuiSelectableFlags_SpanAllColumns))
+                {
+                    request_goto_address(symbol->address);
+                }
+
+                ImGui::PopFont();
+                if (ImGui::BeginPopupContextItem())
+                {
+                    if (ImGui::Selectable("Add Breakpoint"))
+                    {
+                        if (!emu_get_core()->GetM6502()->IsBreakpoint(symbol->address))
+                            emu_get_core()->GetM6502()->AddBreakpoint(symbol->address);
+                    }
+
+                    if (ImGui::Selectable("Add Watch..."))
+                    {
+                        gui_debug_memory_open_watch_popup(0, symbol->address, symbol->text);
+                    }
+
+                    if (is_fixed)
+                    {
+                        if (ImGui::Selectable("Remove Symbol"))
+                        {
+                            gui_debug_remove_symbol(symbol->address);
+                        }
+                    }
+
+                    ImGui::EndPopup();
+                }
+                ImGui::PushFont(gui_default_font);
+
+                ImGui::SameLine(0, 0);
+                ImGui::TextColored(cyan, " %04X", symbol->address);
+
+                ImGui::TableNextColumn();
+                ImGui::TextColored(is_fixed ? green : yellow, "%s", symbol->text);
+
+                ImGui::TableNextColumn();
+                if (is_fixed)
+                    ImGui::TextColored(orange, "Manual");
+                else
+                    ImGui::TextColored(brown, "Auto");
+            }
+        }
+
+        ImGui::PopFont();
+
+        ImGui::EndTable();
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+void gui_debug_add_symbol(const char* symbol_str)
+{
+    add_symbol(symbol_str);
+}
+
+void gui_debug_remove_symbol(u16 address)
+{
+    DebugSymbol* symbol = fixed_symbols[address];
+    if (IsValidPointer(symbol))
+    {
+        for (size_t i = 0; i < fixed_symbol_list.size(); i++)
+        {
+            if (fixed_symbol_list[i].symbol == symbol)
+            {
+                fixed_symbol_list.erase(fixed_symbol_list.begin() + i);
+                break;
+            }
+        }
+        delete symbol;
+        fixed_symbols[address] = NULL;
+        symbols_dirty = true;
+    }
+}
+
+void gui_debug_add_disassembler_bookmark(u16 address, const char* name)
+{
+    DisassemblerBookmark bookmark;
+    bookmark.address = address;
+
+    if (name && strlen(name) > 0)
+    {
+        snprintf(bookmark.name, 32, "%s", name);
+    }
+    else
+    {
+        // Auto-generate name from instruction
+        Memory* memory = emu_get_core()->GetMemory();
+        GLYNX_Disassembler_Record* record = memory->GetDisassemblerRecord(address);
+
+        if (IsValidPointer(record) && (record->name[0] != 0))
+        {
+            std::string instr = record->name;
+            size_t pos = instr.find("{}");
+            if (pos != std::string::npos)
+                instr.replace(pos, 2, "");
+            snprintf(bookmark.name, 32, "%s", instr.c_str());
+        }
+        else
+        {
+            snprintf(bookmark.name, 32, "Bookmark_%04X", address);
+        }
+    }
+
+    bookmarks.push_back(bookmark);
+}
+
+void gui_debug_remove_disassembler_bookmark(u16 address)
+{
+    for (std::vector<DisassemblerBookmark>::iterator it = bookmarks.begin(); it != bookmarks.end(); ++it)
+    {
+        if (it->address == address)
+        {
+            bookmarks.erase(it);
+            break;
+        }
+    }
+}
+
+int gui_debug_get_disassembler_bookmarks(void** bookmarks_ptr)
+{
+    *bookmarks_ptr = (void*)&bookmarks;
+    return (int)bookmarks.size();
+}
+
+int gui_debug_get_symbols(void** symbols_ptr)
+{
+    *symbols_ptr = (void*)fixed_symbols;
+    return 0x10000; // 64K address space
 }
 
 static void save_full_disassembler(FILE* file)
@@ -1610,9 +2131,9 @@ static void save_current_disassembler(FILE* file)
 
         fprintf(file, " %04X ", line.address);
 
-        if (config_debug.dis_replace_symbols && line.record->jump)
+        if (config_debug.dis_replace_symbols)
         {
-            replace_symbols(&line, "");
+            replace_symbols(&line, "", "", "", "");
         }
 
         if (config_debug.dis_replace_labels)
@@ -1647,4 +2168,24 @@ static void save_current_disassembler(FILE* file)
             fprintf(file, "\n\n");
         }
     }
+}
+
+static bool symbol_sort_address_asc(const SymbolEntry& a, const SymbolEntry& b)
+{
+    return a.symbol->address < b.symbol->address;
+}
+
+static bool symbol_sort_address_desc(const SymbolEntry& a, const SymbolEntry& b)
+{
+    return a.symbol->address > b.symbol->address;
+}
+
+static bool symbol_sort_name_asc(const SymbolEntry& a, const SymbolEntry& b)
+{
+    return strcmp(a.symbol->text, b.symbol->text) < 0;
+}
+
+static bool symbol_sort_name_desc(const SymbolEntry& a, const SymbolEntry& b)
+{
+    return strcmp(a.symbol->text, b.symbol->text) > 0;
 }

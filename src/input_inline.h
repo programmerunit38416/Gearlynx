@@ -33,7 +33,7 @@ INLINE GLYNX_Keys Input::MapDirectional(GLYNX_Keys key)
 
     switch (rotation)
     {
-        case ROTATE_RIGHT:
+        case GLYNX_ROTATION_RIGHT:
             if (key == GLYNX_KEY_UP)
                 mapped = GLYNX_KEY_LEFT;
             else if (key == GLYNX_KEY_LEFT)
@@ -44,7 +44,7 @@ INLINE GLYNX_Keys Input::MapDirectional(GLYNX_Keys key)
                 mapped = GLYNX_KEY_UP;
             break;
 
-        case ROTATE_LEFT:
+        case GLYNX_ROTATION_LEFT:
             if (key == GLYNX_KEY_UP)
                 mapped = GLYNX_KEY_RIGHT;
             else if (key == GLYNX_KEY_RIGHT)
@@ -106,6 +106,16 @@ INLINE u8 Input::ReadJoystick()
 INLINE u8 Input::ReadSwitches()
 {
     return (u8)(m_state >> 8);
+}
+
+INLINE void Input::WriteJoystick(u8 value)
+{
+    m_state = (m_state & 0xFF00) | value;
+}
+
+INLINE void Input::WriteSwitches(u8 value)
+{
+    m_state = (m_state & 0x00FF) | ((u16)value << 8);
 }
 
 #endif /* INPUT_INLINE_H */

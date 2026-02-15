@@ -23,7 +23,6 @@
 #include <stdlib.h>
 #include <string>
 #include <string.h>
-#include <fstream>
 #include <time.h>
 #if defined(_WIN32)
 #include <direct.h>
@@ -118,24 +117,24 @@ inline bool is_hex_digit(char c)
 template<typename T>
 inline bool parse_hex_string(const char* str, size_t len, T* result, size_t max_digits = sizeof(T) * 2)
 {
-    if (len == 0 || max_digits == 0)
+    if (len == 0)
         return false;
 
-    for (size_t i = 0; i < len; ++i)
+    while (len > 1 && str[0] == '0')
     {
-        if (!is_hex_digit(str[i]))
-            return false;
+        str++;
+        len--;
     }
 
     if (len > max_digits)
-    {
-        str += (len - max_digits);
-        len = max_digits;
-    }
+        return false;
 
     *result = 0;
-    for (size_t i = 0; i < len; ++i)
+    for (size_t i = 0; i < len; i++)
     {
+        if (!is_hex_digit(str[i]))
+            return false;
+
         *result = (*result << 4);
 
         if (str[i] >= '0' && str[i] <= '9')
@@ -161,6 +160,26 @@ inline bool parse_hex_string(const char* str, size_t len, u16* result)
 inline bool parse_hex_string(const char* str, size_t len, u32* result)
 {
     return parse_hex_string<u32>(str, len, result, 8);
+}
+
+template<typename T>
+inline bool parse_hex_with_prefix(const std::string& hex_str, T* result)
+{
+    const char* str = hex_str.c_str();
+    size_t len = hex_str.length();
+
+    if (len >= 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X'))
+    {
+        str += 2;
+        len -= 2;
+    }
+    else if (len >= 1 && str[0] == '$')
+    {
+        str += 1;
+        len -= 1;
+    }
+
+    return parse_hex_string(str, len, result);
 }
 
 inline char* strncpy_fit(char* dest, const char* src, size_t dest_size)
@@ -230,7 +249,7 @@ inline bool remove_directory_and_contents(const char* path)
 
     struct dirent* entry;
 
-    while ((entry = readdir(dir)) != nullptr)
+    while ((entry = readdir(dir)) != NULL)
     {
         const char* name = entry->d_name;
         if (strcmp(name, ".") && strcmp(name, ".."))
@@ -250,6 +269,52 @@ inline bool remove_directory_and_contents(const char* path)
     return (rmdir(path) == 0);
 #endif
 }
+
+#if defined(_WIN32)
+inline std::wstring utf8_to_wstring(const char* utf8_str)
+{
+    if (!utf8_str || utf8_str[0] == '\0')
+        return std::wstring();
+
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, NULL, 0);
+    if (size_needed <= 0)
+        return std::wstring();
+
+    std::wstring wstr(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, &wstr[0], size_needed);
+    return wstr;
+}
+
+#define open_ifstream_utf8(stream, path, mode) \
+    do { \
+        std::wstring wpath = utf8_to_wstring(path); \
+        stream.open(wpath.c_str(), mode); \
+    } while(0)
+
+#define open_ofstream_utf8(stream, path, mode) \
+    do { \
+        std::wstring wpath = utf8_to_wstring(path); \
+        stream.open(wpath.c_str(), mode); \
+    } while(0)
+
+inline FILE* fopen_utf8(const char* path, const char* mode)
+{
+    std::wstring wpath = utf8_to_wstring(path);
+    std::wstring wmode = utf8_to_wstring(mode);
+    return _wfopen(wpath.c_str(), wmode.c_str());
+}
+#else
+#define open_ifstream_utf8(stream, path, mode) \
+    stream.open(path, mode)
+
+#define open_ofstream_utf8(stream, path, mode) \
+    stream.open(path, mode)
+
+inline FILE* fopen_utf8(const char* path, const char* mode)
+{
+    return fopen(path, mode);
+}
+#endif
 
 inline bool extract_zip_to_folder(const char* zip_path, const char* out_folder)
 {
@@ -308,74 +373,5 @@ inline bool extract_zip_to_folder(const char* zip_path, const char* out_folder)
 
     return true;
 }
-
-#if defined(_WIN32)
-inline std::wstring utf8_to_wstring(const char* utf8_str)
-{
-    if (!utf8_str || utf8_str[0] == '\0')
-        return std::wstring();
-
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, NULL, 0);
-    if (size_needed == 0)
-        return std::wstring();
-
-    std::wstring wstr(size_needed - 1, 0);
-    MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, &wstr[0], size_needed);
-    return wstr;
-}
-
-inline FILE* fopen_utf8(const char* path, const char* mode)
-{
-    if (!path || !mode)
-        return NULL;
-
-    std::wstring wpath = utf8_to_wstring(path);
-    std::wstring wmode = utf8_to_wstring(mode);
-
-    if (wpath.empty() || wmode.empty())
-        return NULL;
-
-    return _wfopen(wpath.c_str(), wmode.c_str());
-}
-
-inline void open_ifstream_utf8(std::ifstream& stream, const char* path, std::ios_base::openmode mode = std::ios_base::in)
-{
-    if (!path)
-        return;
-
-    std::wstring wpath = utf8_to_wstring(path);
-    if (wpath.empty())
-        return;
-
-    stream.open(wpath.c_str(), mode);
-}
-
-inline void open_ofstream_utf8(std::ofstream& stream, const char* path, std::ios_base::openmode mode = std::ios_base::out)
-{
-    if (!path)
-        return;
-
-    std::wstring wpath = utf8_to_wstring(path);
-    if (wpath.empty())
-        return;
-
-    stream.open(wpath.c_str(), mode);
-}
-#else
-inline FILE* fopen_utf8(const char* path, const char* mode)
-{
-    return fopen(path, mode);
-}
-
-inline void open_ifstream_utf8(std::ifstream& stream, const char* path, std::ios_base::openmode mode = std::ios_base::in)
-{
-    stream.open(path, mode);
-}
-
-inline void open_ofstream_utf8(std::ofstream& stream, const char* path, std::ios_base::openmode mode = std::ios_base::out)
-{
-    stream.open(path, mode);
-}
-#endif
 
 #endif /* COMMON_H */

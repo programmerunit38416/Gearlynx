@@ -43,6 +43,7 @@ public:
         bool stop_on_breakpoint;
         bool stop_on_run_to_breakpoint;
         u8 stop_on_irq;
+        bool skip_interrupts_on_step;
     };
 
     typedef void (*GLYNX_Debug_Callback)();
@@ -60,10 +61,10 @@ public:
     void KeyReleased(GLYNX_Keys key);
     void Pause(bool paused);
     bool IsPaused();
-    // void SaveRam();
-    // void SaveRam(const char* path, bool full_path = false);
-    // void LoadRam();
-    // void LoadRam(const char* path, bool full_path = false);
+    void SaveRam();
+    void SaveRam(const char* path, bool full_path = false);
+    void LoadRam();
+    void LoadRam(const char* path, bool full_path = false);
     bool SaveState(const char* path = NULL, int index = -1, bool screenshot = false);
     bool SaveState(u8* buffer, size_t& size, bool screenshot = false);
     bool LoadState(const char* path = NULL, int index = -1);
@@ -81,12 +82,14 @@ public:
     Mikey* GetMikey();
     Bus* GetBus();
     void SetDebugCallback(GLYNX_Debug_Callback callback);
+    u64 GetTotalCycles();
 
 private:
     void Reset();
     template<bool debugger>
     bool RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int* sample_count, GLYNX_Debug_Run* debug);
     void PrepareForHomebrew();
+    void RotateFrameBuffer(u8* frame_buffer, GLYNX_Rotation rotation);
     bool SaveState(std::ostream& stream, size_t& size, bool screenshot);
     bool LoadState(std::istream& stream);
     std::string GetSaveStatePath(const char* path, int index);
@@ -102,6 +105,7 @@ private:
     Mikey* m_mikey;
     bool m_paused;
     GLYNX_Debug_Callback m_debug_callback;
+    u64 m_total_cycles;
 };
 
 #include "gearlynx_core_inline.h"

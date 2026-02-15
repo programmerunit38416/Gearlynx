@@ -30,6 +30,7 @@ class Audio;
 class Suzy;
 class Mikey;
 class M6502;
+class Bus;
 class StateSerializer;
 
 class Memory
@@ -42,13 +43,13 @@ public:
     };
 
 public:
-    Memory(Media* media, Input* input, Suzy* suzy, Mikey* mikey, M6502* m6502);
+    Memory(Media* media, Input* input, Suzy* suzy, Mikey* mikey, M6502* m6502, Bus* bus);
     ~Memory();
     void Init();
-    void Reset();
+    void Reset(bool is_lynx2);
     u8* GetRAM();
-    u8 Read(u16 address);
-    void Write(u16 address, u8 value);
+    template<bool debug = false> u8 Read(u16 address);
+    template<bool debug = false> void Write(u16 address, u8 value);
     Memory_State* GetState();
     GLYNX_Disassembler_Record* GetDisassemblerRecord(u16 address);
     GLYNX_Disassembler_Record* GetOrCreateDisassemblerRecord(u16 address);
@@ -63,8 +64,12 @@ private:
     void RebuildMemoryMap();
     u8 SuzyRead(u16 address);
     void SuzyWrite(u16 address, u8 value);
+    u8 SuzyReadDebug(u16 address);
+    void SuzyWriteDebug(u16 address, u8 value);
     u8 MikeyRead(u16 address);
     void MikeyWrite(u16 address, u8 value);
+    u8 MikeyReadDebug(u16 address);
+    void MikeyWriteDebug(u16 address, u8 value);
     u8 BiosRead(u16 address);
     u8 LastPageRead(u16 address);
     void LastPageWrite(u16 address, u8 value);
@@ -76,6 +81,7 @@ private:
     Suzy* m_suzy;
     Mikey* m_mikey;
     M6502* m_m6502;
+    Bus* m_bus;
     Memory_State m_state;
     GLYNX_Disassembler_Record** m_disassembler;
     u8* m_read_page[256];
@@ -84,6 +90,9 @@ private:
     typedef void (Memory::*PageWriteFn)(u16 addr, u8 v);
     PageReadFn m_read_fn[256];
     PageWriteFn m_write_fn[256];
+    PageReadFn m_read_fn_debug[256];
+    PageWriteFn m_write_fn_debug[256];
+    bool m_is_lynx2;
 };
 
 #include "memory_inline.h"

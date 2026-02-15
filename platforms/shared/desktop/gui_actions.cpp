@@ -24,6 +24,8 @@
 #include "config.h"
 #include "emu.h"
 #include "gearlynx.h"
+#include "application.h"
+#include "display.h"
 
 void gui_action_reset(void)
 {
@@ -39,6 +41,16 @@ void gui_action_reset(void)
 
         for (int i = 0; i < 1024 * 512 * 4; i++)
             emu_frame_buffer[i] = 0;
+    }
+}
+
+void gui_action_reload_rom(void)
+{
+    if (!emu_is_empty() && emu_is_bios_loaded())
+    {
+        char rom_path[4096];
+        strcpy(rom_path, emu_get_core()->GetMedia()->GetFilePath());
+        gui_load_rom(rom_path);
     }
 }
 
@@ -63,10 +75,12 @@ void gui_action_ffwd(void)
     if (config_emulator.ffwd)
     {
         gui_set_status_message("Fast Forward ON", 3000);
+        display_set_vsync(false);
     }
     else
     {
         gui_set_status_message("Fast Forward OFF", 3000);
+        display_set_vsync(config_video.sync);
         emu_audio_reset();
     }
 }

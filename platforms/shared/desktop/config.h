@@ -20,7 +20,7 @@
 #ifndef CONFIG_H
 #define	CONFIG_H
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "gearlynx.h"
 #define MINI_CASE_SENSITIVE
 #include "ini.h"
@@ -32,12 +32,14 @@
     #define EXTERN extern
 #endif
 
+static const int config_version = 2;
 static const int config_max_recent_roms = 10;
 
 struct config_Emulator
 {
     bool maximized = false;
     bool fullscreen = false;
+    int fullscreen_mode = 0;
     bool always_show_menu = false;
     bool paused = false;
     int save_slot = 0;
@@ -58,6 +60,8 @@ struct config_Emulator
     int window_width = 770;
     int window_height = 600;
     bool status_messages = false;
+    int mcp_tcp_port = 7777;
+    int console_type = 0;
 };
 
 struct config_Video
@@ -68,11 +72,12 @@ struct config_Video
     int rotation = 0;
     bool fps = false;
     bool bilinear = false;
-    bool mix_frames = true;
-    float mix_frames_intensity = 0.60f;
+    bool sync = true;
+    bool ghosting = true;
+    float ghosting_intensity = 0.70f;
+    int ghosting_history = 3;
     int scanlines_type = 2;
-    bool scanlines_filter = true;
-    float scanlines_intensity = 0.80f;
+    float scanlines_intensity = 0.65f;
     float background_color[3] = {0.1f, 0.1f, 0.1f};
     float background_color_debugger[3] = {0.2f, 0.2f, 0.2f};
 };
@@ -81,8 +86,9 @@ struct config_Audio
 {
     bool enable = true;
     bool sync = true;
-    float volume[4];
+    float volume[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     int lowpass_cutoff = 3000;
+    int buffer_count = 3;
 };
 
 struct config_Input
@@ -112,6 +118,7 @@ struct config_Input
 enum config_HotkeyIndex
 {
     config_HotkeyIndex_OpenROM = 0,
+    config_HotkeyIndex_ReloadROM,
     config_HotkeyIndex_Quit,
     config_HotkeyIndex_Reset,
     config_HotkeyIndex_Pause,
@@ -157,6 +164,8 @@ struct config_Debug
     bool show_disassembler = true;
     bool show_processor = true;
     bool show_call_stack = false;
+    bool show_breakpoints = false;
+    bool show_symbols = false;
     bool show_memory = false;
     bool show_psg = false;
     bool show_trace_logger = false;
@@ -166,7 +175,11 @@ struct config_Debug
     bool show_suzy_regs = false;
     bool show_suzy_math_regs = false;
     bool show_frame_buffers = false;
+    int frame_buffer_custom_address = 0x0000;
+    bool show_lcd = false;
     bool show_uart = false;
+    bool show_eeprom = false;
+    bool show_cart = false;
     bool trace_counter = true;
     bool trace_registers = true;
     bool trace_flags = true;
@@ -175,15 +188,21 @@ struct config_Debug
     bool dis_show_symbols = true;
     bool dis_show_segment = true;
     bool dis_show_auto_symbols = true;
+    bool dis_dim_auto_symbols = false;
     bool dis_replace_symbols = true;
     bool dis_replace_labels = true;
+    int dis_look_ahead_count = 20;
+    bool step_skip_interrupts = false;
     int font_size = 0;
+    int scale = 2;
     bool multi_viewport = false;
+    bool single_instance = false;
+    bool auto_debug_settings = false;
 };
 
 EXTERN mINI::INIFile* config_ini_file;
 EXTERN mINI::INIStructure config_ini_data;
-EXTERN char* config_root_path;
+EXTERN const char* config_root_path;
 EXTERN char config_emu_file_path[260];
 EXTERN char config_imgui_file_path[260];
 EXTERN config_Emulator config_emulator;
@@ -198,6 +217,7 @@ EXTERN void config_init(void);
 EXTERN void config_destroy(void);
 EXTERN void config_read(void);
 EXTERN void config_write(void);
+EXTERN void config_load_defaults(void);
 EXTERN void config_update_hotkey_string(config_Hotkey* hotkey);
 
 #undef CONFIG_IMPORT

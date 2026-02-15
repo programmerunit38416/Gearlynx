@@ -20,7 +20,8 @@
 #include <string>
 #include <stdexcept>
 #include <algorithm>
-#include <SDL.h>
+#include <SDL3/SDL.h>
+
 #include "gui_debug_memeditor.h"
 #include "gui_debug_constants.h"
 
@@ -40,6 +41,7 @@ MemEditor::MemEditor()
     m_preview_data_type = 0;
     m_preview_endianess = 0;
     m_jump_to_address = -1;
+    m_scroll_to_address = -1;
     InitPointer(m_mem_data);
     m_mem_size = 0;
     m_mem_base_addr = 0;
@@ -51,6 +53,8 @@ MemEditor::MemEditor()
     m_add_bookmark = false;
     m_watch_window = false;
     m_add_watch = false;
+    m_pending_watch_address = -1;
+    m_pending_watch_notes[0] = 0;
     InitPointer(m_gui_font);
     InitPointer(m_draw_list);
     m_search_window = false;
@@ -72,37 +76,38 @@ MemEditor::~MemEditor()
 
 void MemEditor::Reset(const char* title, uint8_t* mem_data, int mem_size, int base_display_addr, int word)
 {
+    SafeDeleteArray(m_search_data);
+
+    snprintf(m_title, sizeof(m_title), "%s", IsValidPointer(title) ? title : "");
+    m_mem_data = NULL;
+    m_mem_size = 0;
+    m_mem_base_addr = base_display_addr;
+    m_mem_word = CLAMP(word, 1, 2);
+    m_hex_addr_digits = 2;
+    m_hex_addr_format[0] = 0;
+
     if (!IsValidPointer(mem_data) || (mem_size <= 0))
         return;
 
-    snprintf(m_title, sizeof(m_title), "%s", title);
     m_mem_data = mem_data;
     m_mem_size = mem_size;
-    m_mem_base_addr = base_display_addr;
-    m_mem_word = word;
 
-    if (m_mem_word < 1)
-        m_mem_word = 1;
-    else if (m_mem_word > 2)
-        m_mem_word = 2;
-
-    m_hex_addr_digits = 1;
     int size = m_mem_base_addr + m_mem_size - 1;
-
+    m_hex_addr_digits = 1;
     while (size >>= 4)
-    {
         m_hex_addr_digits++;
-    }
 
     snprintf(m_hex_addr_format, 8, "%%0%dX", m_hex_addr_digits);
 
-    SafeDeleteArray(m_search_data);
     m_search_data = new uint8_t[m_mem_size * m_mem_word];
     memcpy(m_search_data, m_mem_data, m_mem_size * m_mem_word);
 }
 
 void MemEditor::Draw(bool ascii, bool preview, bool options, bool cursors)
 {
+    if (!IsValidPointer(m_mem_data) || m_mem_size <= 0)
+        return;
+
     if ((m_mem_word > 1) && ((m_preview_data_type < 2) || (m_preview_data_type > 3)))
         m_preview_data_type = 2;
 
@@ -392,6 +397,12 @@ void MemEditor::Draw(bool ascii, bool preview, bool options, bool cursors)
                 ImGui::SetScrollY((m_jump_to_address / m_bytes_per_row) * character_size.y);
                 m_selection_start = m_selection_end = m_jump_to_address;
                 m_jump_to_address = -1;
+            }
+
+            if (m_scroll_to_address >= 0 && m_scroll_to_address < m_mem_size)
+            {
+                ImGui::SetScrollY((m_scroll_to_address / m_bytes_per_row) * character_size.y);
+                m_scroll_to_address = -1;
             }
 
             ImGui::EndTable();
@@ -903,10 +914,21 @@ void MemEditor::WatchPopup()
     {
         static char address[9] = "";
         static char notes[128] = "";
-        int initial_address = m_selection_start + m_mem_base_addr;
+        static int size = 0;
 
-        if (address[0] == 0 && initial_address >= 0)
-            snprintf(address, 9, m_hex_addr_format, initial_address);
+        if (m_pending_watch_address >= 0)
+        {
+            snprintf(address, 9, m_hex_addr_format, m_pending_watch_address);
+            snprintf(notes, 128, "%s", m_pending_watch_notes);
+            m_pending_watch_address = -1;
+        }
+        else
+        {
+            int initial_address = m_selection_start + m_mem_base_addr;
+
+            if (address[0] == 0 && initial_address >= 0)
+                snprintf(address, 9, m_hex_addr_format, initial_address);
+        }
 
         ImGui::Text("Address:");
 
@@ -918,6 +940,10 @@ void MemEditor::WatchPopup()
         ImGui::SetItemDefaultFocus();
 
         ImGui::InputTextWithHint("##bookaddr", buf, address, m_hex_addr_digits + 1, ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase);
+
+        ImGui::Text("Size:");
+        ImGui::PushItemWidth(120);
+        ImGui::Combo("##watch_size", &size, "8 bits\0" "16 bits\0" "24 bits\0" "32 bits\0\0");
 
         ImGui::Text("Description:");
         ImGui::PushItemWidth(200);
@@ -937,12 +963,15 @@ void MemEditor::WatchPopup()
                     Watch watch;
                     watch.address = watch_address;
                     snprintf(watch.notes, 128, "%s", notes);
+                    watch.size = size;
+                    watch.format = 0;
                     m_watches.push_back(watch);
                 }
 
                 ImGui::CloseCurrentPopup();
                 address[0] = 0;
                 notes[0] = 0;
+                size = 0;
 
                 m_watch_window = true;
             }
@@ -954,6 +983,7 @@ void MemEditor::WatchPopup()
             ImGui::CloseCurrentPopup();
             address[0] = 0;
             notes[0] = 0;
+            size = 0;
         }
         ImGui::EndPopup();
     }
@@ -963,7 +993,27 @@ void MemEditor::WatchPopup()
 
 void MemEditor::SearchCapture()
 {
+    if (!IsValidPointer(m_mem_data) || !IsValidPointer(m_search_data) || m_mem_size <= 0)
+        return;
     memcpy(m_search_data, m_mem_data, m_mem_size);
+}
+
+int MemEditor::PerformSearch(int op, int compare_type, int compare_value, int data_type)
+{
+    m_search_operator = op;
+    m_search_compare_type = compare_type;
+    m_search_compare_specific_value = compare_value;
+    m_search_compare_specific_address = compare_value;
+    m_search_data_type = data_type;
+
+    CalculateSearchResults();
+
+    return (int)m_search_results.size();
+}
+
+std::vector<MemEditor::Search>* MemEditor::GetSearchResults()
+{
+    return &m_search_results;
 }
 
 void MemEditor::StepFrame()
@@ -982,16 +1032,41 @@ char* MemEditor::GetTitle()
     return m_title;
 }
 
+std::vector<MemEditor::Watch>* MemEditor::GetWatches()
+{
+    return &m_watches;
+}
+
+void MemEditor::GetSelection(int* start, int* end)
+{
+    *start = m_selection_start;
+    *end = m_selection_end;
+}
+
+void MemEditor::SetSelection(int start, int end)
+{
+    m_selection_start = start;
+    m_selection_end = end;
+}
+
+void MemEditor::ScrollToAddress(int address)
+{
+    if (address >= m_mem_base_addr && address < (m_mem_base_addr + m_mem_size))
+    {
+        int offset = address - m_mem_base_addr;
+        m_scroll_to_address = offset;
+    }
+}
+
 void MemEditor::WatchWindow()
 {
     ImVec4 addr_color = cyan;
+    ImVec4 size_color = yellow;
     ImVec4 notes_color = violet;
-    ImVec4 normal_color = white;
-    ImVec4 gray_color = mid_gray;
 
     PushGuiFont();
 
-    ImGui::SetNextWindowSize(ImVec2(300, 400), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
     char window_title[64];
     snprintf(window_title, 64, "%s Watches", m_title);
     ImGui::Begin(window_title, &m_watch_window);
@@ -1010,38 +1085,42 @@ void MemEditor::WatchWindow()
 
     ImGui::Separator();
 
-    PopGuiFont();
-
-    ImVec2 character_size = ImGui::CalcTextSize("0");
+    const char* size_labels[] = {"8 bit", "16 bit", "24 bit", "32 bit"};
+    const char* format_labels[] = {"Hex", "Binary", "Decimal Unsigned", "Decimal Signed"};
 
     int remove = -1;
 
-    if (ImGui::BeginTable("##hex", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoKeepColumnsVisible | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
+
+    if (ImGui::BeginTable("watches", 4, flags))
     {
-        ImGui::TableSetupColumn("ADDRESS");
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, character_size.x);
-
-        ImGui::TableSetupColumn("VALUE", ImGuiTableColumnFlags_WidthFixed, character_size.x * ((m_mem_word * 2) + 1));
-
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, character_size.x);
-        ImGui::TableSetupColumn("NOTES");
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 44.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Notes", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
 
         int total_rows = (int)m_watches.size();
 
         ImGuiListClipper clipper;
         clipper.Begin(total_rows);
 
+        PopGuiFont();
+
         while (clipper.Step())
         {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++)
             {
-                Watch watch = m_watches[row];
+                Watch& watch = m_watches[row];
 
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
 
+                ImGui::PushID(row);
+
                 char remove_id[64];
-                snprintf(remove_id, 64, "X##remove_%s_%d", m_title, row);
+                snprintf(remove_id, 64, "X##rm%d", row);
 
                 if (ImGui::SmallButton(remove_id))
                 {
@@ -1057,43 +1136,71 @@ void MemEditor::WatchWindow()
                 ImGui::SameLine();
 
                 char single_addr[32];
-                snprintf(single_addr, 32, "%s:  ", m_hex_addr_format);
-                ImGui::TextColored(addr_color, single_addr, watch.address);
-                ImGui::TableNextColumn();
+                snprintf(single_addr, 32, m_hex_addr_format, watch.address);
+                ImGui::TextColored(addr_color, "$%s", single_addr);
+
                 ImGui::TableNextColumn();
 
-                uint16_t data = 0;
-                int address = watch.address - m_mem_base_addr;
+                int size_index = (watch.size >= 0 && watch.size <= 3) ? watch.size : 0;
+                ImGui::TextColored(size_color, "%s", size_labels[size_index]);
 
-                if (m_mem_word == 1)
-                    data = m_mem_data[address];
-                else if (m_mem_word == 2)
+                ImGui::TableNextColumn();
+
+                char sel_id[16];
+                snprintf(sel_id, sizeof(sel_id), "##wv%d", row);
+                ImGui::Selectable(sel_id, false, ImGuiSelectableFlags_SpanAllColumns);
+
+                if (ImGui::BeginPopupContextItem())
                 {
-                    uint16_t* mem_data_16 = (uint16_t*)m_mem_data;
-                    data = mem_data_16[address];
+                    PushGuiFont();
+
+                    if (ImGui::Selectable("Remove Watch"))
+                    {
+                        remove = row;
+                    }
+
+                    ImGui::Separator();
+                    ImGui::Text("Display as:");
+                    //ImGui::Separator();
+
+                    for (int f = 0; f < 4; f++)
+                    {
+                        bool selected = (watch.format == f);
+                        if (ImGui::Selectable(format_labels[f], selected))
+                        {
+                            watch.format = f;
+                        }
+                    }
+
+                    PopGuiFont();
+
+                    ImGui::EndPopup();
                 }
 
-                bool gray_out = m_gray_out_zeros && (data == 0);
-                ImVec4 color = gray_out ? gray_color : normal_color;
+                ImGui::SameLine(0, 0);
+                uint32_t value = ReadWatchValue(watch);
+                DrawWatchValue(value, watch.size, watch.format);
 
-                if (m_mem_word == 1)
-                    ImGui::TextColored(color, m_uppercase_hex ? "%02X" : "%02x", data);
-                else if (m_mem_word == 2)
-                    ImGui::TextColored(color, m_uppercase_hex ? "%04X" : "%04x", data);
-
-                ImGui::TableNextColumn();
                 ImGui::TableNextColumn();
 
                 ImGui::TextColored(notes_color, "%s", watch.notes);
+
+                ImGui::PopID();
             }
         }
+
+        PushGuiFont();
+
         ImGui::EndTable();
     }
+
 
     if (remove >= 0)
     {
         m_watches.erase(m_watches.begin() + remove);
     }
+
+    PopGuiFont();
 
     ImGui::End();
 }
@@ -1643,7 +1750,182 @@ void MemEditor::AddWatch()
     m_add_watch = true;
 }
 
+void MemEditor::PrepareAddWatch(int address, const char* notes)
+{
+    m_pending_watch_address = address;
+    if (notes && strlen(notes) > 0)
+        snprintf(m_pending_watch_notes, sizeof(m_pending_watch_notes), "%s", notes);
+    else
+        m_pending_watch_notes[0] = 0;
+    m_add_watch = true;
+}
+
+void MemEditor::AddWatchDirect(int address, const char* notes, int size)
+{
+    Watch watch;
+    watch.address = address;
+
+    if (notes && strlen(notes) > 0)
+        snprintf(watch.notes, 128, "%s", notes);
+    else
+        snprintf(watch.notes, 128, "Watch_%04X", address);
+
+    watch.size = (size >= 0 && size <= 3) ? size : 0;
+    watch.format = 0;
+    m_watches.push_back(watch);
+    m_watch_window = true;
+}
+
+uint32_t MemEditor::ReadWatchValue(const Watch& watch)
+{
+    int bytes = WatchSizeBytes(watch.size);
+    int byte_offset = (watch.address - m_mem_base_addr) * m_mem_word;
+    int total_bytes = m_mem_size * m_mem_word;
+    uint32_t value = 0;
+
+    for (int i = 0; i < bytes && (byte_offset + i) < total_bytes; i++)
+    {
+        value |= (uint32_t)m_mem_data[byte_offset + i] << (i * 8);
+    }
+
+    return value;
+}
+
+int MemEditor::WatchSizeBytes(int size)
+{
+    switch (size)
+    {
+        case 0: return 1;
+        case 1: return 2;
+        case 2: return 3;
+        case 3: return 4;
+        default: return 1;
+    }
+}
+
+void MemEditor::DrawWatchValue(uint32_t value, int size, int format)
+{
+    ImVec4 gray_color = mid_gray;
+    ImVec4 normal_color = white;
+    bool gray_out = m_gray_out_zeros && (value == 0);
+    ImVec4 color = gray_out ? gray_color : normal_color;
+
+    int bytes = WatchSizeBytes(size);
+
+    switch (format)
+    {
+        case 0: // Hex
+        {
+            switch (bytes)
+            {
+                case 1: ImGui::TextColored(color, m_uppercase_hex ? "%02X" : "%02x", value); break;
+                case 2: ImGui::TextColored(color, m_uppercase_hex ? "%04X" : "%04x", value); break;
+                case 3: ImGui::TextColored(color, m_uppercase_hex ? "%06X" : "%06x", value); break;
+                case 4: ImGui::TextColored(color, m_uppercase_hex ? "%08X" : "%08x", value); break;
+            }
+            break;
+        }
+        case 1: // Binary
+        {
+            int total_bits = bytes * 8;
+            std::string bin = "";
+            for (int i = 0; i < total_bits; i++)
+            {
+                if ((i % 4) == 0 && i > 0)
+                    bin = " " + bin;
+                bin = ((value >> i) & 1 ? "1" : "0") + bin;
+            }
+            ImGui::TextColored(color, "%s", bin.c_str());
+            break;
+        }
+        case 2: // Dec unsigned
+        {
+            ImGui::TextColored(color, "%u", value);
+            break;
+        }
+        case 3: // Dec signed
+        {
+            int32_t signed_value;
+            switch (bytes)
+            {
+                case 1: signed_value = (int8_t)(uint8_t)value; break;
+                case 2: signed_value = (int16_t)(uint16_t)value; break;
+                case 3: signed_value = (value & 0x800000) ? (int32_t)(value | 0xFF000000) : (int32_t)value; break;
+                case 4: signed_value = (int32_t)value; break;
+                default: signed_value = (int32_t)value; break;
+            }
+            ImGui::TextColored(color, "%d", signed_value);
+            break;
+        }
+    }
+}
+
 void MemEditor::SetGuiFont(ImFont* gui_font)
 {
     m_gui_font = gui_font;
+}
+
+void MemEditor::SaveSettings(std::ostream& stream)
+{
+    int bookmark_count = (int)m_bookmarks.size();
+    stream.write((const char*)&bookmark_count, sizeof(int));
+    for (int i = 0; i < bookmark_count; i++)
+    {
+        stream.write((const char*)&m_bookmarks[i].address, sizeof(int));
+        stream.write(m_bookmarks[i].name, sizeof(m_bookmarks[i].name));
+    }
+
+    int watch_count = (int)m_watches.size();
+    stream.write((const char*)&watch_count, sizeof(int));
+    for (int i = 0; i < watch_count; i++)
+    {
+        stream.write((const char*)&m_watches[i].address, sizeof(int));
+        stream.write(m_watches[i].notes, sizeof(m_watches[i].notes));
+        stream.write((const char*)&m_watches[i].size, sizeof(int));
+        stream.write((const char*)&m_watches[i].format, sizeof(int));
+    }
+
+    stream.write((const char*)&m_bytes_per_row, sizeof(int));
+    stream.write((const char*)&m_preview_data_type, sizeof(int));
+    stream.write((const char*)&m_preview_endianess, sizeof(int));
+    stream.write((const char*)&m_uppercase_hex, sizeof(bool));
+    stream.write((const char*)&m_gray_out_zeros, sizeof(bool));
+}
+
+void MemEditor::LoadSettings(std::istream& stream)
+{
+    m_bookmarks.clear();
+    int bookmark_count = 0;
+    stream.read((char*)&bookmark_count, sizeof(int));
+    for (int i = 0; i < bookmark_count; i++)
+    {
+        Bookmark bookmark;
+        stream.read((char*)&bookmark.address, sizeof(int));
+        stream.read(bookmark.name, sizeof(bookmark.name));
+        m_bookmarks.push_back(bookmark);
+    }
+
+    m_watches.clear();
+    int watch_count = 0;
+    stream.read((char*)&watch_count, sizeof(int));
+    for (int i = 0; i < watch_count; i++)
+    {
+        Watch watch;
+        stream.read((char*)&watch.address, sizeof(int));
+        stream.read(watch.notes, sizeof(watch.notes));
+        stream.read((char*)&watch.size, sizeof(int));
+        stream.read((char*)&watch.format, sizeof(int));
+        m_watches.push_back(watch);
+    }
+
+    stream.read((char*)&m_bytes_per_row, sizeof(int));
+    stream.read((char*)&m_preview_data_type, sizeof(int));
+    stream.read((char*)&m_preview_endianess, sizeof(int));
+    stream.read((char*)&m_uppercase_hex, sizeof(bool));
+    stream.read((char*)&m_gray_out_zeros, sizeof(bool));
+
+    if (m_bytes_per_row < 4) m_bytes_per_row = 4;
+    if (m_bytes_per_row > 32) m_bytes_per_row = 32;
+    if (m_preview_data_type < 0 || m_preview_data_type > 5) m_preview_data_type = 0;
+    if (m_preview_endianess < 0 || m_preview_endianess > 1) m_preview_endianess = 0;
 }

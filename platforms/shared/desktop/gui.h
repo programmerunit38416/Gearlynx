@@ -20,7 +20,7 @@
 #ifndef GUI_H
 #define GUI_H
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "gearlynx.h"
 #include "imgui.h"
 #include "config.h"
@@ -34,6 +34,7 @@
 enum gui_ShortCutEvent
 {
     gui_ShortcutOpenROM = 0,
+    gui_ShortcutReloadROM,
     gui_ShortcutReset,
     gui_ShortcutPause,
     gui_ShortcutFFWD,
@@ -62,10 +63,11 @@ struct gui_HotkeyMapping
     bool allow_repeat;
 };
 
-#define GUI_HOTKEY_MAP_COUNT 17
+#define GUI_HOTKEY_MAP_COUNT 18
 
 const gui_HotkeyMapping gui_hotkey_map[GUI_HOTKEY_MAP_COUNT] = {
     {gui_ShortcutOpenROM, config_HotkeyIndex_OpenROM, false},
+    {gui_ShortcutReloadROM, config_HotkeyIndex_ReloadROM, false},
     {gui_ShortcutReset, config_HotkeyIndex_Reset, false},
     {gui_ShortcutPause, config_HotkeyIndex_Pause, false},
     {gui_ShortcutFFWD, config_HotkeyIndex_FFWD, false},
@@ -94,6 +96,7 @@ EXTERN ImFont* gui_material_icons_font;
 EXTERN int gui_main_window_width;
 EXTERN int gui_main_window_height;
 EXTERN int gui_main_menu_height;
+EXTERN int gui_scale_multiplier;
 EXTERN SDL_Scancode* gui_configured_key;
 EXTERN int* gui_configured_button;
 EXTERN config_Hotkey* gui_configured_hotkey;
@@ -106,7 +109,7 @@ EXTERN void gui_render(void);
 EXTERN void gui_shortcut(gui_ShortCutEvent event);
 EXTERN void gui_load_rom(const char* path);
 EXTERN void gui_load_bios(const char* path);
-EXTERN void gui_set_status_message(const char* message, u32 milliseconds);
+EXTERN void gui_set_status_message(const char* message, Uint64 milliseconds);
 EXTERN void gui_set_error_message(const char* message);
 
 #undef GUI_IMPORT

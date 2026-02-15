@@ -53,6 +53,13 @@ struct GLYNX_Runtime_Info
     float frame_time;
 };
 
+enum GLYNX_Console_Type
+{
+    GLYNX_CONSOLE_AUTO = 0,
+    GLYNX_CONSOLE_MODEL_I,
+    GLYNX_CONSOLE_MODEL_II
+};
+
 enum GLYNX_Bios_State
 {
     BIOS_LOAD_OK = 0,
@@ -89,9 +96,10 @@ enum GLYNX_Keys
 
 enum GLYNX_Rotation
 {
-    NO_ROTATION = 0,
-    ROTATE_LEFT = 1,
-    ROTATE_RIGHT = 2
+    GLYNX_ROTATION_AUTO = 0,
+    GLYNX_ROTATION_LEFT = 1,
+    GLYNX_ROTATION_RIGHT = 2,
+    GLYNX_ROTATION_DISABLED = 3
 };
 
 struct GLYNX_Cartridge_Header
@@ -114,6 +122,18 @@ struct GLYNX_BS93_Header
     u16 boot_address;
     u16 size;
     u8 bs93[4];
+};
+
+enum GLYNX_EEPROM
+{
+    GLYNX_EEPROM_NONE = 0,
+    GLYNX_EEPROM_93C46 = 1,
+    GLYNX_EEPROM_93C56 = 2,
+    GLYNX_EEPROM_93C66 = 3,
+    GLYNX_EEPROM_93C76 = 4,
+    GLYNX_EEPROM_93C86 = 5,
+    GLYNX_EEPROM_SD = 0x40,
+    GLYNX_EEPROM_8BIT = 0x80
 };
 
 struct GLYNX_SaveState_Header
@@ -158,6 +178,9 @@ struct GLYNX_Disassembler_Record
     u8 jump_bank;
     bool subroutine;
     int irq;
+    bool has_operand_address;
+    u16 operand_address;
+    bool operand_is_zp;
 };
 
 struct GLYNX_Mikey_Timer

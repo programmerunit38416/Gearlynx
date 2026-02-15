@@ -23,11 +23,10 @@
 #include "fonts/RobotoMedium.h"
 #include "fonts/MaterialIcons.h"
 #include "fonts/IconsMaterialDesign.h"
-#include "nfd.h"
 #include "config.h"
 #include "application.h"
 #include "emu.h"
-#include "renderer.h"
+#include "ogl_renderer.h"
 #include "utils.h"
 #include "gearlynx.h"
 
@@ -44,8 +43,8 @@
 
 static bool status_message_active = false;
 static char status_message[4096] = "";
-static u32 status_message_start_time = 0;
-static u32 status_message_duration = 0;
+static Uint64 status_message_start_time = 0;
+static Uint64 status_message_duration = 0;
 static bool error_window_active = false;
 static char error_message[4096] = "";
 static void main_window(void);
@@ -60,12 +59,6 @@ bool gui_init(void)
     gui_main_window_width = 0;
     gui_main_window_height = 0;
 
-    if (NFD_Init() != NFD_OKAY)
-    {
-        Error("NFD Error: %s", NFD_GetError());
-        return false;
-    }
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
@@ -75,29 +68,28 @@ bool gui_init(void)
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigDockingWithShift = true;
     io.IniFilename = config_imgui_file_path;
-    io.FontGlobalScale /= application_display_scale;
 
 #if defined(__APPLE__) || defined(_WIN32)
     if (config_debug.multi_viewport)
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 #endif
 
-    gui_roboto_font = io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMedium_compressed_data, RobotoMedium_compressed_size, 17.0f * application_display_scale, NULL, io.Fonts->GetGlyphRangesCyrillic());
+    gui_roboto_font = io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMedium_compressed_data, RobotoMedium_compressed_size, 17.0f, NULL, io.Fonts->GetGlyphRangesCyrillic());
 
-    float iconFontSize = 20.0f * application_display_scale;
+    float iconFontSize = 20.0f;
     static const ImWchar icons_ranges[] = { ICON_MIN_MD, ICON_MAX_16_MD, 0 };
     ImFontConfig icons_config;
     icons_config.MergeMode = true;
     icons_config.PixelSnapH = true;
     icons_config.GlyphMinAdvanceX = iconFontSize;
-    icons_config.GlyphOffset = { 0.0f, 5.0f * application_display_scale };
+    icons_config.GlyphOffset = { 0.0f, 5.0f };
     gui_material_icons_font = io.Fonts->AddFontFromMemoryCompressedTTF(MaterialIcons_compressed_data, MaterialIcons_compressed_size, iconFontSize, &icons_config, icons_ranges);
 
     ImFontConfig font_cfg;
 
     for (int i = 0; i < 4; i++)
     {
-        font_cfg.SizePixels = (13.0f + (i * 3)) * application_display_scale;
+        font_cfg.SizePixels = (13.0f + (i * 3));
         gui_default_fonts[i] = io.Fonts->AddFontDefault(&font_cfg);
     }
 
@@ -106,11 +98,11 @@ bool gui_init(void)
     set_style();
 
     emu_force_rotation(config_video.rotation);
+    emu_force_console_type(config_emulator.console_type);
     emu_audio_mute(!config_audio.enable);
     emu_audio_set_lowpass_cutoff((float)config_audio.lowpass_cutoff);
     for (int i = 0; i < 4; i++)
         emu_audio_set_volume(i, config_audio.volume[i]);
-    emu_debug_set_callback(gui_debug_callback);
 
     strcpy(gui_savefiles_path, config_emulator.savefiles_path.c_str());
     strcpy(gui_savestates_path, config_emulator.savestates_path.c_str());
@@ -129,10 +121,10 @@ bool gui_init(void)
 
 void gui_destroy(void)
 {
+    gui_debug_auto_save_settings();
     gui_debug_destroy();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
-    NFD_Quit();
 }
 
 void gui_render(void)
@@ -168,6 +160,10 @@ void gui_shortcut(gui_ShortCutEvent event)
     {  
     case gui_ShortcutOpenROM:
         gui_shortcut_open_rom = true;
+        break;
+    case gui_ShortcutReloadROM:
+        if (config_debug.debug)
+            gui_action_reload_rom();
         break;
     case gui_ShortcutReset:
         gui_action_reset();
@@ -262,6 +258,8 @@ void gui_load_rom(const char* path)
     message += path;
     gui_set_status_message(message.c_str(), 3000);
 
+    gui_debug_auto_save_settings();
+
     push_recent_rom(path);
     emu_resume();
 
@@ -294,6 +292,8 @@ void gui_load_rom(const char* path)
     str = str.substr(0, str.find_last_of("."));
     str += ".sym";
     gui_debug_load_symbols_file(str.c_str());
+
+    gui_debug_auto_load_settings();
 
     if (config_emulator.start_paused)
     {
@@ -356,7 +356,7 @@ void gui_load_bios(const char* path)
     gui_action_reset();
 }
 
-void gui_set_status_message(const char* message, u32 milliseconds)
+void gui_set_status_message(const char* message, Uint64 milliseconds)
 {
     if (config_emulator.status_messages)
     {
@@ -412,11 +412,7 @@ static void main_window(void)
 
     if (config_debug.debug)
     {
-        if ((config_video.scale != 0))
-            scale_multiplier = config_video.scale_manual;
-        else
-            scale_multiplier = 1;
-
+        scale_multiplier = config_debug.scale;
         w_corrected = base_width;
         h_corrected = base_height;
     }
@@ -463,6 +459,7 @@ static void main_window(void)
 
     gui_main_window_width = w_corrected * scale_multiplier;
     gui_main_window_height = h_corrected * scale_multiplier;
+    gui_scale_multiplier = scale_multiplier;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -473,7 +470,8 @@ static void main_window(void)
     {
         flags |= ImGuiWindowFlags_AlwaysAutoResize;
 
-        ImGui::SetNextWindowPos(ImVec2(583, 26), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(602, 26), ImGuiCond_FirstUseEver);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
         ImGui::Begin("Output###debug_output", &config_debug.show_screen, flags);
         gui_main_window_hovered = ImGui::IsWindowHovered();
@@ -496,7 +494,7 @@ static void main_window(void)
     float tex_h = (float)runtime.screen_width / (float)(SYSTEM_TEXTURE_WIDTH);
     float tex_v = (float)runtime.screen_height / (float)(SYSTEM_TEXTURE_HEIGHT);
 
-    ImGui::Image((ImTextureID)(intptr_t)renderer_emu_texture, ImVec2((float)gui_main_window_width, (float)gui_main_window_height), ImVec2(0, 0), ImVec2(tex_h, tex_v));
+    ImGui::Image((ImTextureID)(intptr_t)ogl_renderer_emu_texture, ImVec2((float)gui_main_window_width, (float)gui_main_window_height), ImVec2(0, 0), ImVec2(tex_h, tex_v));
 
     if (config_video.fps)
         gui_show_fps();
@@ -505,11 +503,7 @@ static void main_window(void)
 
     ImGui::PopStyleVar();
     ImGui::PopStyleVar();
-
-    if (!config_debug.debug)
-    {
-        ImGui::PopStyleVar();
-    }
+    ImGui::PopStyleVar();
 }
 
 static void push_recent_rom(std::string path)
@@ -537,7 +531,7 @@ static void show_status_message(void)
 {
     if (status_message_active)
     {
-        u32 current_time = SDL_GetTicks();
+        Uint64 current_time = SDL_GetTicks();
         if ((current_time - status_message_start_time) > status_message_duration)
             status_message_active = false;
         else
@@ -641,9 +635,9 @@ static void set_style(void)
     style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.6266094446182251f, 0.6266031861305237f, 0.6266063451766968f, 1.0f);
     style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.9999899864196777f, 0.9999899864196777f, 1.0f, 1.0f);
     style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.9999899864196777f, 0.9999899864196777f, 1.0f, 1.0f);
-    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.8745098114013672f, 0.007843137718737125f, 0.3882353007793427f, 1.0f);
-    style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.8745098114013672f, 0.007843137718737125f, 0.3882353007793427f, 1.0f);
-    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.8745098114013672f, 0.007843137718737125f, 0.3882353007793427f, 1.0f);
+    style.Colors[ImGuiCol_CheckMark] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
+    style.Colors[ImGuiCol_SliderGrab] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.0f, 0.75f, 0.4f, 1.0f);
     style.Colors[ImGuiCol_Button] = ImVec4(0.184547483921051f, 0.184547483921051f, 0.1845493316650391f, 1.0f);
     style.Colors[ImGuiCol_ButtonHovered] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
     style.Colors[ImGuiCol_ButtonActive] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
@@ -661,9 +655,9 @@ static void set_style(void)
     style.Colors[ImGuiCol_TabActive] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.1450980454683304f, 0.1450980454683304f, 0.1490196138620377f, 1.0f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
-    style.Colors[ImGuiCol_PlotLines] = ImVec4(0.8745098114013672f, 0.007843137718737125f, 0.3882353007793427f, 1.0f);
+    style.Colors[ImGuiCol_PlotLines] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
     style.Colors[ImGuiCol_PlotLinesHovered] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
-    style.Colors[ImGuiCol_PlotHistogram] = ImVec4(0.8745098114013672f, 0.007843137718737125f, 0.3882353007793427f, 1.0f);
+    style.Colors[ImGuiCol_PlotHistogram] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
     style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.0f, 0.5529411764705883f, 0.0f, 1.0f);
     style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.1882352977991104f, 0.1882352977991104f, 0.2000000029802322f, 1.0f);
     style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.3098039329051971f, 0.3098039329051971f, 0.3490196168422699f, 1.0f);

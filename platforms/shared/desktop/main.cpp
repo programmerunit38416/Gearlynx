@@ -17,21 +17,32 @@
  *
  */
 
+#include <SDL3/SDL_main.h>
 #include "gearlynx.h"
 #include "application.h"
 #include "gdb_interface.h"
 #include "emu.h"
+#include "config.h"
+#include "console_utils.h"
 #include <cstdlib>
+
+extern bool g_mcp_stdio_mode;
 
 int main(int argc, char* argv[])
 {
+    attach_parent_console(argc, argv);
+
     char* rom_file = NULL;
     char* symbol_file = NULL;
     bool show_usage = false;
     bool force_fullscreen = false;
     bool force_windowed = false;
     int gdb_port = 0;  // 0 = disabled
+    int mcp_mode = -1; // -1 = disabled, 0 = stdio, 1 = tcp
+    int mcp_tcp_port = 7777;
     int ret = 0;
+    bool mcp_stdio_set = false;
+    bool mcp_http_set = false;
 
     for (int i = 1; i < argc; i++)
     {
@@ -72,6 +83,29 @@ int main(int argc, char* argv[])
             {
                 gdb_port = 1234;  // Default GDB port
             }
+            else if (strcmp(argv[i], "--mcp-stdio") == 0)
+            {
+                g_mcp_stdio_mode = true;  // Disable logging immediately
+                mcp_stdio_set = true;
+                mcp_mode = 0;
+            }
+            else if (strcmp(argv[i], "--mcp-http") == 0)
+            {
+                mcp_http_set = true;
+                mcp_mode = 1;
+            }
+            else if (strcmp(argv[i], "--mcp-http-port") == 0)
+            {
+                if (i + 1 < argc)
+                {
+                    mcp_tcp_port = atoi(argv[++i]);
+                    if (mcp_tcp_port <= 0 || mcp_tcp_port > 65535)
+                    {
+                        printf("Invalid port number: %d\n", mcp_tcp_port);
+                        mcp_tcp_port = 7777;
+                    }
+                }
+            }
             else
             {
                 printf("Unknown option: %s\n", argv[i]);
@@ -102,25 +136,42 @@ int main(int argc, char* argv[])
         }
     }
 
+    if (mcp_stdio_set && mcp_http_set)
+    {
+        printf("Error: Cannot use both --mcp-stdio and --mcp-http at the same time\n");
+        return -1;
+    }
+
     if (show_usage)
     {
         printf("Usage: %s [options] [game_file] [symbol_file]\n", argv[0]);
         printf("  [game_file]         Game file: accepts ROMs (.lyx, .lnx, .o) or ZIP (.zip)\n");
         printf("\nOptions:\n");
-        printf("  -f, --fullscreen    Start in fullscreen mode\n");
-        printf("  -w, --windowed      Start in windowed mode with menu visible\n");
-        printf("  -g, --gdb           Enable GDB server on default port 1234 (with GUI)\n");
-        printf("  --gdb-port=PORT     Enable GDB server on specified port (with GUI)\n");
-        printf("  -v, --version       Display version information\n");
-        printf("  -h, --help          Display this help message\n");
+        printf("  -f, --fullscreen      Start in fullscreen mode\n");
+        printf("  -w, --windowed        Start in windowed mode with menu visible\n");
+        printf("  -g, --gdb             Enable GDB server on default port 1234 (with GUI)\n");
+        printf("      --gdb-port=PORT   Enable GDB server on specified port (with GUI)\n");
+        printf("      --mcp-stdio       Auto-start MCP server with stdio transport\n");
+        printf("      --mcp-http        Auto-start MCP server with HTTP transport\n");
+        printf("      --mcp-http-port N HTTP port for MCP server (default: 7777)\n");
+        printf("  -v, --version         Display version information\n");
+        printf("  -h, --help            Display this help message\n");
         return ret;
     }
 
     if (force_fullscreen && force_windowed)
         force_fullscreen = false;
 
-    // Initialize GUI application
-    ret = application_init(rom_file, symbol_file, force_fullscreen, force_windowed);
+    config_init();
+    config_read();
+
+    if (!application_check_single_instance(rom_file, symbol_file))
+    {
+        config_destroy();
+        return 0;
+    }
+
+    ret = application_init(rom_file, symbol_file, force_fullscreen, force_windowed, mcp_mode, mcp_tcp_port);
 
     if (ret != 0)
     {
@@ -160,6 +211,9 @@ int main(int argc, char* argv[])
     }
 
     application_destroy();
+
+    config_write();
+    config_destroy();
 
     return ret;
 }

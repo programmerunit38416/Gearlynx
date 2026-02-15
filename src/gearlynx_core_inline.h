@@ -32,7 +32,7 @@ INLINE bool GearlynxCore::RunToVBlank(u8* frame_buffer, s16* sample_buffer, int*
 {
     if (!m_media->IsBiosLoaded())
     {
-        m_mikey->RenderNoBiosScreen(frame_buffer);
+        m_mikey->GetLcdScreen()->RenderNoBiosScreen(frame_buffer);
         return false;
     }
 
@@ -54,7 +54,7 @@ INLINE bool GearlynxCore::RunToVBlank(u8* frame_buffer, s16* sample_buffer, int*
 template<bool debugger>
 bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int* sample_count, GLYNX_Debug_Run* debug)
 {
-    m_mikey->SetBuffer(frame_buffer);
+    m_mikey->GetLcdScreen()->SetBuffer(frame_buffer);
 
     if (debugger)
     {
@@ -64,6 +64,7 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
         {
             debug_enable = true;
             m_m6502->EnableBreakpoints(debug->stop_on_breakpoint, debug->stop_on_irq);
+            m_m6502->SetSkipIRQOnStep(debug->skip_interrupts_on_step);
         }
 
         bool stop = false;
@@ -75,7 +76,10 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
                 m_debug_callback();
 
             u32 cpu_cycles = m_m6502->RunInstruction();
-            u32 lynx_cycles = (cpu_cycles * 5) + m_bus->ConsumeCycles();
+            u32 lynx_cycles = cpu_cycles + m_bus->ConsumeCycles();
+            m_total_cycles += lynx_cycles;
+
+            //Debug("-> CPU cycles=%u, Lynx cycles=%u", cpu_cycles, lynx_cycles);
 
             m_suzy->Clock(lynx_cycles);
             stop = m_mikey->Clock(lynx_cycles);
@@ -113,13 +117,13 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
 
         bool bp_hit = m_m6502->BreakpointHit();
         bool rtb_hit = m_m6502->RunToBreakpointHit();
-        // Only log if a breakpoint was hit (to avoid spam)
         if (bp_hit || rtb_hit)
         {
             Log("RunToVBlankTemplate: Exiting with breakpoint! cycles=%u, BreakpointHit=%d, RunToBreakpointHit=%d, PC=0x%04X",
                   failsafe_cycle_count, bp_hit, rtb_hit, m_m6502->GetState()->PC.GetValue());
         }
 
+        m_mikey->GetLcdScreen()->EndFrame(m_media->GetRotation());
         m_audio->EndFrame(sample_buffer, sample_count);
 
         return bp_hit || rtb_hit;
@@ -134,7 +138,8 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
         do
         {
             u32 cpu_cycles = m_m6502->RunInstruction();
-            u32 lynx_cycles = (cpu_cycles * 5) - 1;
+            u32 lynx_cycles = cpu_cycles + m_bus->ConsumeCycles();
+            m_total_cycles += lynx_cycles;
 
             m_suzy->Clock(lynx_cycles);
             stop = m_mikey->Clock(lynx_cycles);
@@ -149,6 +154,7 @@ bool GearlynxCore::RunToVBlankTemplate(u8* frame_buffer, s16* sample_buffer, int
         }
         while (!stop);
 
+        m_mikey->GetLcdScreen()->EndFrame(m_media->GetRotation());
         m_audio->EndFrame(sample_buffer, sample_count);
 
         return false;

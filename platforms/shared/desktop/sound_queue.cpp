@@ -17,215 +17,193 @@
  *
  */
 
-#include "sound_queue.h"
 #include <string>
-#include <assert.h>
-#include "gearlynx.h"
+#include <string.h>
 
-static void sdl_error(const char* str)
-{
-    const char* sdl_str = SDL_GetError();
-    if (sdl_str && *sdl_str)
-        Log("Sound Queue: %s - SDL Error: %s", str, sdl_str);
-    else
-        Log("Sound Queue: %s", str);
-}
+#define SOUND_QUEUE_IMPORT
+#include "sound_queue.h"
+#include "utils.h"
 
-SoundQueue::SoundQueue()
+static SDL_AudioStream* sound_queue_stream;
+static bool sound_queue_sound_open;
+static int sound_queue_max_queued_bytes;
+static int sound_queue_buffer_size;
+static int sound_queue_bytes_per_second;
+static s16* sound_queue_last_written;
+
+static bool is_running_in_wsl(void);
+
+void sound_queue_init(void)
 {
-    m_buffers = NULL;
-    m_free_sem = NULL;
-    m_sound_open = false;
-    m_sync_output = true;
+    InitPointer(sound_queue_stream);
+    InitPointer(sound_queue_last_written);
+    sound_queue_sound_open = false;
 
     int audio_drivers_count = SDL_GetNumAudioDrivers();
-    int audio_devices_count = SDL_GetNumAudioDevices(0);
 
-    Debug("SoundQueue: %d audio backends", audio_drivers_count);
+    Debug("Sound Queue: %d audio drivers", audio_drivers_count);
 
     for (int i = 0; i < audio_drivers_count; i++)
     {
-        Debug("SoundQueue: %s", SDL_GetAudioDriver(i));
-    }
-
-    Debug("SoundQueue: %d audio devices", audio_devices_count);
-
-    for (int i = 0; i < audio_devices_count; i++)
-    {
-        Debug("SoundQueue: %s", SDL_GetAudioDeviceName(i, 0));
+        Log("Sound Queue: Driver [%s]", SDL_GetAudioDriver(i));
     }
 
     std::string platform = SDL_GetPlatform();
     if (platform == "Linux")
     {
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0)
-            sdl_error("Couldn't init AUDIO subsystem");
-
-        if (IsRunningInWSL())
+        if (is_running_in_wsl())
         {
-            Debug("SoundQueue: Running in WSL");
-            if (SDL_AudioInit("pulseaudio") < 0)
-                sdl_error("Couldn't init pulseaudio audio driver");
+            Debug("Sound Queue: Running in WSL");
+            SDL_SetHint("SDL_AUDIODRIVER", "pulseaudio");
         }
         else
         {
-            Debug("SoundQueue: Running in Linux");
-            if (SDL_AudioInit("alsa") < 0)
-                sdl_error("Couldn't init alsa audio driver");
+            Debug("Sound Queue: Running in Linux");
         }
     }
-    else
+
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+        SDL_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO)");
+
+    Log("Sound Queue: [%s] driver selected", SDL_GetCurrentAudioDriver());
+
+    int audio_devices_count = 0;
+    SDL_AudioDeviceID* devices = SDL_GetAudioPlaybackDevices(&audio_devices_count);
+
+    Debug("Sound Queue: %d audio devices", audio_devices_count);
+
+    if (devices)
     {
-        if (SDL_Init(SDL_INIT_AUDIO) < 0)
-            sdl_error("Couldn't init AUDIO");
+        for (int i = 0; i < audio_devices_count; i++)
+        {
+            Log("Sound Queue: Device [%s]", SDL_GetAudioDeviceName(devices[i]));
+        }
+        SDL_free(devices);
     }
-
-    Log("SoundQueue: %s driver selected", SDL_GetCurrentAudioDriver());
-
-    atexit(SDL_Quit);
 }
 
-SoundQueue::~SoundQueue()
+void sound_queue_destroy(void)
 {
-    Stop();
+    sound_queue_stop();
 }
 
-bool SoundQueue::Start(int sample_rate, int channel_count, int buffer_size, int buffer_count)
+bool sound_queue_start(int sample_rate, int channel_count, int buffer_size, int buffer_count)
 {
-    Log("SoundQueue: Starting with %d Hz, %d channels, %d buffer size, %d buffers ...", sample_rate, channel_count, buffer_size, buffer_count);
+    Debug("Sound Queue: Starting with %d Hz, %d channels, %d buffer size, %d buffers ...", sample_rate, channel_count, buffer_size, buffer_count);
 
-    m_write_buffer = 0;
-    m_write_position = 0;
-    m_read_buffer = 0;
-    m_buffer_size = buffer_size;
-    m_buffer_count = buffer_count;
+    sound_queue_buffer_size = buffer_size;
+    sound_queue_max_queued_bytes = buffer_size * buffer_count * (int)sizeof(s16);
+    sound_queue_bytes_per_second = sample_rate * channel_count * (int)sizeof(s16);
 
-    m_buffers = new int16_t[m_buffer_size * m_buffer_count];
-    m_currently_playing = m_buffers;
-
-    for (int i = 0; i < (m_buffer_size * m_buffer_count); i++)
-        m_buffers[i] = 0;
-
-    m_free_sem = SDL_CreateSemaphore(m_buffer_count - 1);
-    if (!m_free_sem)
-    {
-        sdl_error("Couldn't create semaphore");
-        return false;
-    }
+    sound_queue_last_written = new s16[buffer_size];
+    memset(sound_queue_last_written, 0, buffer_size * sizeof(s16));
 
     SDL_AudioSpec spec;
     spec.freq = sample_rate;
-    spec.format = AUDIO_S16SYS;
+    spec.format = SDL_AUDIO_S16;
     spec.channels = channel_count;
-    spec.silence = 0;
-    spec.samples = m_buffer_size / channel_count;
-    spec.size = 0;
-    spec.callback = FillBufferCallback;
-    spec.userdata = this;
 
-    Log("SoundQueue: Desired -  frequency: %d format: f %d s %d be %d sz %d channels: %d samples: %d", spec.freq, SDL_AUDIO_ISFLOAT(spec.format), SDL_AUDIO_ISSIGNED(spec.format), SDL_AUDIO_ISBIGENDIAN(spec.format), SDL_AUDIO_BITSIZE(spec.format), spec.channels, spec.samples);
+    Debug("Sound Queue: Spec - frequency: %d format: 0x%04X channels: %d", spec.freq, spec.format, spec.channels);
 
-    if (SDL_OpenAudio(&spec, NULL) < 0)
+    sound_queue_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+
+    if (!sound_queue_stream)
     {
-        sdl_error("Couldn't open SDL audio");
+        SDL_ERROR("SDL_OpenAudioDeviceStream");
         return false;
     }
 
-    Log("SoundQueue: Obtained - frequency: %d format: f %d s %d be %d sz %d channels: %d samples: %d", spec.freq, SDL_AUDIO_ISFLOAT(spec.format), SDL_AUDIO_ISSIGNED(spec.format), SDL_AUDIO_ISBIGENDIAN(spec.format), SDL_AUDIO_BITSIZE(spec.format), spec.channels, spec.samples);
+    SDL_AudioDeviceID selected_device = SDL_GetAudioStreamDevice(sound_queue_stream);
 
-    SDL_PauseAudio(false);
-    m_sound_open = true;
+    Log("Sound Queue: Started [%s] - frequency: %d format: 0x%04X channels: %d", SDL_GetAudioDeviceName(selected_device), spec.freq, spec.format, spec.channels);
+
+    SDL_ResumeAudioStreamDevice(sound_queue_stream);
+    sound_queue_sound_open = true;
 
     return true;
 }
 
-void SoundQueue::Stop()
+void sound_queue_stop(void)
 {
-    if (m_sound_open)
+    if (sound_queue_sound_open)
     {
-        m_sound_open = false;
-        SDL_PauseAudio(true);
-        SDL_CloseAudio();
+        sound_queue_sound_open = false;
+        if (sound_queue_stream)
+        {
+            SDL_PauseAudioStreamDevice(sound_queue_stream);
+            SDL_DestroyAudioStream(sound_queue_stream);
+            InitPointer(sound_queue_stream);
+        }
+
+        Debug("Sound Queue: Stopped");
     }
 
-    if (m_free_sem)
-    {
-        SDL_DestroySemaphore(m_free_sem);
-        m_free_sem = NULL;
-    }
-
-    delete [] m_buffers;
-    m_buffers = NULL;
+    SafeDeleteArray(sound_queue_last_written);
 }
 
-int SoundQueue::GetSampleCount()
+int sound_queue_get_sample_count(void)
 {
-    int buffer_free = SDL_SemValue(m_free_sem) * m_buffer_size + (m_buffer_size - m_write_position);
-    return m_buffer_size * m_buffer_count - buffer_free;
+    if (!sound_queue_stream)
+        return 0;
+    return SDL_GetAudioStreamQueued(sound_queue_stream) / (int)sizeof(s16);
 }
 
-int16_t* SoundQueue::GetCurrentlyPlaying()
+s16* sound_queue_get_currently_playing(void)
 {
-    return m_currently_playing;
+    return sound_queue_last_written;
 }
 
-bool SoundQueue::IsOpen()
+bool sound_queue_is_open(void)
 {
-    return m_sound_open;
+    return sound_queue_sound_open;
 }
 
-void SoundQueue::Write(int16_t* samples, int count, bool sync)
+void sound_queue_write(s16* samples, int count, bool sync)
 {
-    if (!m_sound_open)
+    if (!sound_queue_sound_open || !sound_queue_stream)
         return;
 
-    m_sync_output = sync;
+    int bytes = count * (int)sizeof(s16);
+    int queued = SDL_GetAudioStreamQueued(sound_queue_stream);
 
-    while (count)
+    if (count > sound_queue_buffer_size)
     {
-        int n = m_buffer_size - m_write_position;
-        if (n > count)
-            n = count;
-
-        memcpy(Buffer(m_write_buffer) + m_write_position, samples, n * sizeof(int16_t));
-        samples += n;
-        m_write_position += n;
-        count -= n;
-
-        if (m_write_position >= m_buffer_size)
-        {
-            m_write_position = 0;
-            m_write_buffer = (m_write_buffer + 1) % m_buffer_count;
-            
-            if (m_sync_output)
-                SDL_SemWait(m_free_sem);
-        }
+        Log("Sound Queue: Write exceeds queue buffer size (%d > %d)", count, sound_queue_buffer_size);
     }
-}
 
-void SoundQueue::FillBuffer(uint8_t* buffer, int count)
-{
-    if ((SDL_SemValue(m_free_sem) < (unsigned int)m_buffer_count - 1) || !m_sync_output)
+    if (queued == 0)
     {
-        m_currently_playing = Buffer(m_read_buffer);
-        memcpy( buffer, Buffer(m_read_buffer), count);
-        m_read_buffer = (m_read_buffer + 1) % m_buffer_count;
+        Debug("Sound Queue: Underrun detected, queue was empty");
+    }
 
-        if (m_sync_output)
-            SDL_SemPost(m_free_sem);
+    if (sync)
+    {
+        int room = sound_queue_max_queued_bytes - queued;
+        if (room < bytes)
+        {
+            Debug("Sound Queue: Sync overrun, queued %d >= max %d, waiting...", queued, sound_queue_max_queued_bytes);
+            int needed = bytes - room;
+            int wait_ms = (needed * 1000) / sound_queue_bytes_per_second;
+            if (wait_ms >= 1)
+                SDL_Delay(wait_ms);
+        }
     }
     else
     {
-        memset(buffer, 0, count);
+        if (queued >= sound_queue_max_queued_bytes)
+        {
+            Debug("Sound Queue: Async overrun, dropping frame (queued %d >= max %d)", queued, sound_queue_max_queued_bytes);
+            return;
+        }
     }
+
+    SDL_PutAudioStreamData(sound_queue_stream, samples, bytes);
+
+    int copy_count = count < sound_queue_buffer_size ? count : sound_queue_buffer_size;
+    memcpy(sound_queue_last_written, samples + (count - copy_count), copy_count * sizeof(s16));
 }
 
-void SoundQueue::FillBufferCallback(void* user_data, uint8_t* buffer, int count)
-{
-    ((SoundQueue*) user_data)->FillBuffer(buffer, count);
-}
-
-bool SoundQueue::IsRunningInWSL()
+static bool is_running_in_wsl(void)
 {
     FILE *file;
 

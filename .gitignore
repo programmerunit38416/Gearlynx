@@ -2,8 +2,10 @@
 *.DS_Store
 *.dylib
 *.app/
+platforms/macos/mcp
 
 # Visual Studio files
+.vscode/mcp.json
 .vs/
 ipch/
 [Oo]bj
@@ -76,3 +78,6 @@ platforms/libretro/libs/
 
 #JetBrains
 .idea
+
+#Value Change Dump files
+*.vcd

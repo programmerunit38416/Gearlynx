@@ -27,12 +27,14 @@
 #include "m6502.h"
 #include "bit_ops.h"
 #include "bus.h"
+#include "lcd_screen.h"
+#include "eeprom.h"
 
 INLINE bool Mikey::Clock(u32 cycles)
 {
-    m_debug_cycles += cycles;
-    UpdateTimers(cycles);
+    UpdateVideo(cycles);
     UpdateAudio(cycles);
+    UpdateTimers(cycles);
     UpdateIRQs();
 
     bool ret = m_state.frame_ready;
@@ -46,9 +48,13 @@ INLINE bool Mikey::Clock(u32 cycles)
     return ret;
 }
 
+template<bool debug>
 INLINE u8 Mikey::Read(u16 address)
 {
-    m_bus->InjectCycles(10);
+    if (!debug)
+    {
+        m_bus->InjectCycles(k_bus_cycles_mikey_read);
+    }
 
     if (address < 0xFD20)
         return ReadTimer(address);
@@ -75,8 +81,11 @@ INLINE u8 Mikey::Read(u16 address)
             DebugMikey("Reading MAGRDY1 (unused): 00");
             return 0x00;
         case MIKEY_AUDIN:         // 0xFD86
-            DebugMikey("Reading AUDIN (unused): 80");
-            return 0x80;
+        {
+            u8 ret = 0x80;
+            DebugMikey("Reading AUDIN: %02X", ret);
+            return ret;
+        }
         case MIKEY_SYSCTL1:       // 0xFD87
             DebugMikey("Reading write-only SYSCTL1: FF");
             return 0xFF;
@@ -91,16 +100,42 @@ INLINE u8 Mikey::Read(u16 address)
         case MIKEY_IODAT:         // 0xFD8B
         {
             u8 ret = 0x00;
+
+            // Bit 0: External power input
             if (IS_SET_BIT(m_state.IODIR, 0))
                 ret |= IS_SET_BIT(m_state.IODAT, 0) ? 0x01 : 0x00;
+            else
+                ret |= 0x01;  // Input defaults to high (power connected)
+
+            // Bit 1: Cart address data output (0 turns cart power on)
             if (IS_SET_BIT(m_state.IODIR, 1))
                 ret |= IS_SET_BIT(m_state.IODAT, 1) ? 0x02 : 0x00;
+            // else input reads low
+
+            // Bit 2: No expansion (input high when ComLynx cable not present)
             if (IS_SET_BIT(m_state.IODIR, 2))
                 ret |= IS_SET_BIT(m_state.IODAT, 2) ? 0x04 : 0x00;
+            else
+                ret |= 0x04;  // Input defaults to high (no cable present)
+
+            // Bit 3: Rest signal (output with REST signal gating)
             if (IS_SET_BIT(m_state.IODIR, 3))
                 ret |= (IS_SET_BIT(m_state.IODAT, 3) && m_state.rest) ? 0x08 : 0x00;
+            // else input reads low
+
+            // Bit 4: AUDIN - Audio input / EEPROM data / Cart AUDIN
+            // When configured as input, defaults to high (EEPROM write done / cart ready)
+            // EEPROM can override this when actively sending data
             if (IS_SET_BIT(m_state.IODIR, 4))
                 ret |= IS_SET_BIT(m_state.IODAT, 4) ? 0x10 : 0x00;
+            else if (m_media->GetEEPROMInstance()->IsAvailable())
+            {
+                if (!debug)
+                    m_media->GetEEPROMInstance()->ProcessBusy();
+                ret |= m_media->GetEEPROMInstance()->OutputBit() ? 0x10 : 0x00;
+            }
+            else
+                ret |= 0x10;  // Input defaults to high (ready/done signal)
 
             //DebugMikey("Reading IODAT: %02X", ret);
 
@@ -125,14 +160,17 @@ INLINE u8 Mikey::Read(u16 address)
             u8 ret = m_state.uart.rx_data;
             DebugMikey("Reading SERDAT (RX): %02X", ret);
 
-            if (m_state.uart.rxq_count > 0)
+            if (!debug)
             {
-                m_state.uart.rxq_head ^= 1;
-                m_state.uart.rxq_count--;
-            }
+                if (m_state.uart.rxq_count > 0)
+                {
+                    m_state.uart.rxq_head ^= 1;
+                    m_state.uart.rxq_count--;
+                }
 
-            UartRxReflectHead();
-            UartRelevelIRQ();
+                UartRxReflectHead();
+                UartRelevelIRQ();
+            }
             return ret;
         }
         case MIKEY_SDONEACK:      // 0xFD90
@@ -163,7 +201,7 @@ INLINE u8 Mikey::Read(u16 address)
             DebugMikey("Reading MTEST2 (unused): FF");
             return 0xFF;
         default:
-            assert(false && "Unhandled Mikey Read Address");
+            //assert(false && "Unhandled Mikey Read Address");
             DebugMikey("Register READ called with unknown address: %04X", address);
             return 0xFF;
         }
@@ -173,9 +211,13 @@ INLINE u8 Mikey::Read(u16 address)
     return 0xFF;
 }
 
+template<bool debug>
 INLINE void Mikey::Write(u16 address, u8 value)
 {
-    m_bus->InjectCycles(20);
+    if (!debug)
+    {
+        m_bus->InjectCycles(k_bus_cycles_mikey_write);
+    }
 
     if (address < 0xFD20)
         WriteTimer(address, value);
@@ -224,11 +266,27 @@ INLINE void Mikey::Write(u16 address, u8 value)
         case MIKEY_IODIR:         // 0xFD8A
             DebugMikey("Setting IODIR to %02X (was %02X)", value, m_state.IODIR);
             m_state.IODIR = value;
+
+            if (IS_SET_BIT(m_state.IODIR, 4))
+                m_media->SetAudinValue(IS_SET_BIT(m_state.IODAT, 4));
+            else
+                m_media->SetAudinValue(false);
+
+            if (m_media->GetEEPROMInstance()->IsAvailable())
+                m_media->GetEEPROMInstance()->ProcessIO(m_state.IODIR, m_state.IODAT);
+
             break;
         case MIKEY_IODAT:         // 0xFD8B
             DebugMikey("Setting IODAT to %02X (was %02X)", value, m_state.IODAT);
             m_media->ShiftRegisterBit(IS_SET_BIT(value, 1));
             m_state.IODAT = value;
+
+            if (IS_SET_BIT(m_state.IODIR, 4))
+                m_media->SetAudinValue(IS_SET_BIT(m_state.IODAT, 4));
+
+            if (m_media->GetEEPROMInstance()->IsAvailable())
+                m_media->GetEEPROMInstance()->ProcessIO(m_state.IODIR, m_state.IODAT);
+
             break;
         case MIKEY_SERCTL:        // 0xFD8C
         {
@@ -314,6 +372,7 @@ INLINE void Mikey::Write(u16 address, u8 value)
         case MIKEY_PBKUP:         // 0xFD93
             DebugMikey("Setting PBKUP to %02X (was %02X)", value, m_state.PBKUP);
             m_state.PBKUP = value;
+            m_lcd_screen->ConfigureLineTiming();
             break;
         case MIKEY_DISPADRL:      // 0xFD94
             DebugMikey("Setting DISPADR low to %02X (was %02X)", value, m_state.DISPADR.low);
@@ -345,29 +404,9 @@ INLINE Mikey::Mikey_State* Mikey::GetState()
     return &m_state;
 }
 
-INLINE void Mikey::SetBuffer(u8* frame_buffer)
+INLINE LcdScreen* Mikey::GetLcdScreen()
 {
-    m_frame_buffer = frame_buffer;
-}
-
-INLINE u8* Mikey::GetBuffer()
-{
-    return m_frame_buffer;
-}
-
-INLINE u32* Mikey::GetRGBA8888Palette()
-{
-    return m_rgba8888_palette;
-}
-
-INLINE u16* Mikey::GetRGB565Palette()
-{
-    return m_rgb565_palette;
-}
-
-INLINE GLYNX_Pixel_Format Mikey::GetPixelFormat()
-{
-    return m_pixel_format;
+    return m_lcd_screen;
 }
 
 inline u8 Mikey::ReadColor(u16 address)
@@ -377,7 +416,7 @@ inline u8 Mikey::ReadColor(u16 address)
     int color_index = address & 0xF;
 
     if (address < MIKEY_BLUERED0)
-        return m_state.colors[color_index].green;
+        return m_state.colors[color_index].green & 0x0F;
     else
         return m_state.colors[color_index].bluered;
 }
@@ -393,13 +432,15 @@ inline void Mikey::WriteColor(u16 address, u8 value)
     else
         m_state.colors[color_index].bluered = value;
 
-    m_host_palette[color_index] = ((m_state.colors[color_index].green & 0x0F) << 8) | (m_state.colors[color_index].bluered & 0xFF);
+    m_lcd_screen->UpdatePalette(color_index, ((m_state.colors[color_index].green & 0x0F) << 8) | (m_state.colors[color_index].bluered & 0xFF));
 }
 
 
 inline u8 Mikey::ReadTimer(u16 address)
 {
     assert(address >= MIKEY_TIM0BKUP && address <= MIKEY_TIM7CTLB);
+
+    m_bus->InjectCycles(k_bus_cycles_timer);
 
     int reg = address & 3;
     int i = (address >> 2) & 7;
@@ -428,6 +469,8 @@ inline void Mikey::WriteTimer(u16 address, u8 value)
 {
     assert(address >= MIKEY_TIM0BKUP && address <= MIKEY_TIM7CTLB);
 
+    m_bus->InjectCycles(k_bus_cycles_timer);
+
     int reg = address & 3;
     int i = (address >> 2) & 7;
     GLYNX_Mikey_Timer* t = &m_state.timers[i];
@@ -437,6 +480,8 @@ inline void Mikey::WriteTimer(u16 address, u8 value)
     case 0:
         DebugMikey("Setting Timer %d Backup to %02X (was %02X)", i, value, t->backup);
         t->backup = value;
+        if (i == 0) // HCOUNT timer
+            m_lcd_screen->ConfigureLineTiming();
         break;
     case 1:
     {
@@ -456,8 +501,15 @@ inline void Mikey::WriteTimer(u16 address, u8 value)
 
         if (prescaler_changed || enable_count_rising)
         {
-            t->internal_cycles = 0;
+            if (enable_count_rising)
+                t->internal_cycles = (t->internal_period_cycles / 2) + 1;
+            else
+                t->internal_cycles = 0;
+
             t->internal_pending_ticks = 0;
+
+            if (i == 0) // HCOUNT timer
+                m_lcd_screen->ConfigureLineTiming();
         }
 
         // Timer 4 (UART) does NOT use CTRLA[7] for its IRQ; it's masked by SERCTL
@@ -478,8 +530,7 @@ inline void Mikey::WriteTimer(u16 address, u8 value)
     case 2:
         DebugMikey("Setting Timer %d Counter to %02X (was %02X)", i, value, m_state.timers[i].counter);
         t->counter = value;
-        t->internal_cycles = 0;
-        t->internal_pending_ticks = 0;
+        t->internal_cycles = (t->internal_period_cycles / 2) + 1;
         break;
     case 3:
         DebugMikey("Setting Timer %d Control B to %02X (was %02X)", i, value, m_state.timers[i].control_b);
@@ -495,6 +546,8 @@ inline void Mikey::WriteTimer(u16 address, u8 value)
 inline u8 Mikey::ReadAudio(u16 address)
 {
     assert(address >= MIKEY_AUD0VOL && address <= MIKEY_AUD3MISC);
+
+    m_bus->InjectCycles(k_bus_cycles_audio);
 
     int reg = address & 7;
     int i = ((address - MIKEY_AUD0VOL) >> 3) & 3;
@@ -526,6 +579,8 @@ inline u8 Mikey::ReadAudio(u16 address)
 inline void Mikey::WriteAudio(u16 address, u8 value)
 {
     assert(address >= MIKEY_AUD0VOL && address <= MIKEY_AUD3MISC);
+
+    m_bus->InjectCycles(k_bus_cycles_audio);
 
 #ifndef GLYNX_DISABLE_VGMRECORDER
     if (m_audio->IsVgmRecording())
@@ -570,7 +625,10 @@ inline void Mikey::WriteAudio(u16 address, u8 value)
 
         if (prescaler_changed || enable_count_rising)
         {
-            c->internal_cycles = 0;
+            if (enable_count_rising)
+                c->internal_cycles = (c->internal_period_cycles / 2);
+            else
+                c->internal_cycles = 0;
             c->internal_pending_ticks = 0;
             CalculateCutoff(i);
         }
@@ -586,8 +644,7 @@ inline void Mikey::WriteAudio(u16 address, u8 value)
     }
     case 6:
         c->counter = value;
-        c->internal_cycles = 0;
-        c->internal_pending_ticks = 0;
+        c->internal_cycles = (c->internal_period_cycles / 2);
         break;
     case 7:
         if (IS_NOT_SET_BIT(c->other, 1) && IS_SET_BIT(value, 1))
@@ -756,8 +813,6 @@ INLINE bool Mikey::BorrowInTimer(int i, GLYNX_Mikey_Timer* t)
 
         if (likely(i == 0))
             HorizontalBlank();
-        else if (i == 2)
-            VerticalBlank();
         else if (i == 4)
             UartClock();
 
@@ -917,6 +972,13 @@ INLINE void Mikey::RebuildLFSR(GLYNX_Mikey_Audio* channel)
 inline void Mikey::CalculateCutoff(u8 channel)
 {
     GLYNX_Mikey_Audio* c = &m_state.audio[channel];
+
+    // When channel is disabled games can use direct PCM writes
+    if (IS_NOT_SET_BIT(c->control, 3))
+    {
+        c->internal_mix = true;
+        return;
+    }
 
     if (c->internal_period_cycles != 0)
     {
@@ -1108,6 +1170,19 @@ inline void Mikey::UartClock()
         }
 
         UartRelevelIRQ();
+    }
+}
+
+INLINE void Mikey::UpdateVideo(u32 cycles)
+{
+    m_lcd_screen->Update(cycles);
+
+    m_state.refresh_cycle_counter += cycles;
+
+    while (m_state.refresh_cycle_counter >= k_mikey_refresh_period_cycles)
+    {
+        m_state.refresh_cycle_counter -= k_mikey_refresh_period_cycles;
+        m_bus->InjectCycles(k_mikey_refresh_inject_cycles);
     }
 }
 

@@ -31,7 +31,21 @@
 #include <linux/limits.h>
 #endif
 #include <math.h>
+#include <SDL3/SDL.h>
 #include "imgui.h"
+#include "gearlynx.h"
+
+static inline void sdl_log_error(const char* action, const char* file, int line)
+{
+    const char* error = SDL_GetError();
+    if (error && error[0] != '\0')
+    {
+        Log("SDL Error: %s (%s:%d) - %s", action, file, line, error);
+        SDL_ClearError();
+    }
+}
+
+#define SDL_ERROR(action) sdl_log_error(action, __FILE__, __LINE__)
 
 #define BYTE_TO_BINARY_PATTERN "%c%c%c%c%c%c%c%c"
 #define BYTE_TO_BINARY_PATTERN_SPACED "%c%c%c%c %c%c%c%c"
@@ -61,14 +75,37 @@ static inline int get_reset_value(int option)
     }
 }
 
+static inline int ends_with(const char* s, const char* suffix)
+{
+    size_t sl = strlen(s);
+    size_t su = strlen(suffix);
+
+    if (sl < su)
+    {
+        return 0;
+    }
+
+    return (memcmp(s + (sl - su), suffix, su) == 0);
+}
+
 static inline void get_executable_path(char* path, size_t size)
 {
 #if defined(_WIN32)
     DWORD len = GetModuleFileNameA(NULL, path, (DWORD)size);
-    if (len > 0 && len < size) {
+    if (len > 0 && len < size)
+    {
         char* last_slash = strrchr(path, '\\');
         if (last_slash) *last_slash = '\0';
-    } else {
+
+        // Check if we're in an MCPB bundle (server\ subfolder)
+        char* server_pos = strstr(path, "\\server");
+        if (server_pos && (server_pos[7] == '\0' || server_pos[7] == '\\'))
+        {
+            *server_pos = '\0';  // Truncate at server\ to get bundle root
+        }
+    }
+    else
+    {
         path[0] = '\0';
     }
 #elif defined(__APPLE__)
@@ -76,17 +113,48 @@ static inline void get_executable_path(char* path, size_t size)
     if (_NSGetExecutablePath(path, &bufsize) == 0) {
         char* dir = dirname(path);
         strncpy(path, dir, size);
-        path[size-1] = '\0';
-    } else {
+        path[size - 1] = '\0';
+
+        // Check if we're in an MCPB bundle (server/ subfolder)
+        char* server_pos = strstr(path, "/server");
+        if (server_pos && (server_pos[7] == '\0' || server_pos[7] == '/'))
+        {
+            *server_pos = '\0';  // Truncate at server/ to get bundle root
+        }
+        // If running inside a .app bundle, use Contents/Resources as data root
+        else if (ends_with(path, "/Contents/MacOS"))
+        {
+            size_t len = strlen(path);
+            const char* repl = "Resources";
+
+            // Replace the trailing "MacOS" with "Resources"
+            if (len >= strlen("MacOS") && (len - strlen("MacOS") + strlen(repl) + 1) <= size)
+            {
+                memcpy(path + (len - strlen("MacOS")), repl, strlen(repl) + 1);
+            }
+        }
+    }
+    else
+    {
         path[0] = '\0';
     }
 #elif defined(__linux__)
-    ssize_t len = readlink("/proc/self/exe", path, size-1);
-    if (len != -1) {
+    ssize_t len = readlink("/proc/self/exe", path, size - 1);
+    if (len != -1)
+    {
         path[len] = '\0';
         char* last_slash = strrchr(path, '/');
         if (last_slash) *last_slash = '\0';
-    } else {
+
+        // Check if we're in an MCPB bundle (server/ subfolder)
+        char* server_pos = strstr(path, "/server");
+        if (server_pos && (server_pos[7] == '\0' || server_pos[7] == '/'))
+        {
+            *server_pos = '\0';  // Truncate at server/ to get bundle root
+        }
+    }
+    else
+    {
         path[0] = '\0';
     }
 #else
@@ -95,37 +163,27 @@ static inline void get_executable_path(char* path, size_t size)
 #endif
 }
 
-static inline bool SliderFloatWithSteps(const char* label, float* v, float v_min, float v_max, float v_step, const char* display_format)
+static inline void strip_color_tags(std::string& str)
 {
-    if (!display_format)
-        display_format = "%.3f";
-
-    float v_f = *v;
-    bool value_changed = ImGui::SliderFloat(label, &v_f, v_min, v_max, display_format, ImGuiSliderFlags_AlwaysClamp);
-    float remain = fmodf((v_f-v_min), v_step);
-    *v = (v_f - remain);
-    return value_changed;
+    size_t pos = 0;
+    while ((pos = str.find('{', pos)) != std::string::npos)
+    {
+        size_t end_pos = str.find('}', pos);
+        if (end_pos != std::string::npos)
+            str.erase(pos, end_pos - pos + 1);
+        else
+            pos++;
+    }
 }
 
-static inline bool SliderIntWithSteps(const char* label, int* v, int v_min, int v_max, int v_step, const char* display_format)
+static inline ImVec4 color_444_to_float(u16 color)
 {
-    if (!display_format)
-        display_format = "%d";
-
-    if (v_step <= 0)
-        v_step = 1;
-
-    int v_i = *v;
-    bool value_changed = ImGui::SliderInt(label, &v_i, v_min, v_max, display_format, ImGuiSliderFlags_AlwaysClamp);
-
-    int diff = v_i - v_min;
-    int remain = diff % v_step;
-
-    if (remain < 0)
-        remain += v_step;
-
-    *v = v_i - remain;
-    return value_changed;
+    ImVec4 ret;
+    ret.w = 1.0f;
+    ret.x = (1.0f / 15.0f) * (color & 0xF);
+    ret.z = (1.0f / 15.0f) * ((color >> 4) & 0xF);
+    ret.y = (1.0f / 15.0f) * ((color >> 8) & 0xF);
+    return ret;
 }
 
 #endif /* UTILS_H */

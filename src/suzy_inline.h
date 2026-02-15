@@ -32,11 +32,29 @@ INLINE void Suzy::Clock(u32 cycles)
     UpdateMath(cycles);
 }
 
+template<bool debug>
 INLINE u8 Suzy::Read(u16 address)
 {
-    m_bus->InjectCycles(15);
+    if (!debug)
+    {
+        m_bus->InjectCycles(k_bus_cycles_suzy_read);
+    }
 
-    switch(address)
+    u16 effective_addr = address;
+
+    // Mirror math registers (FC40-FC6F) to sprite registers (FC00-FC2F)
+    if (address >= 0xFC40 && address <= 0xFC6F)
+    {
+        effective_addr = address - 0x40;
+    }
+
+    // Open bus for unused ranges
+    else if ((address >= 0xFC30 && address <= 0xFC3F) || (address >= 0xFC70 && address <= 0xFC7F))
+    {
+        return 0xFF;
+    }
+
+    switch(effective_addr)
     {
     case SUZY_TMPADRL:     // 0xFC00
         return m_state.TMPADR.low;
@@ -134,34 +152,6 @@ INLINE u8 Suzy::Read(u16 address)
         return m_state.PROCADR.low;
     case SUZY_PROCADRH:    // 0xFC2F
         return m_state.PROCADR.high;
-    case SUZY_MATHD:       // 0xFC52
-        return m_state.MATHD;
-    case SUZY_MATHC:       // 0xFC53
-        return m_state.MATHC;
-    case SUZY_MATHB:       // 0xFC54
-        return m_state.MATHB;
-    case SUZY_MATHA:       // 0xFC55
-        return m_state.MATHA;
-    case SUZY_MATHP:       // 0xFC56
-        return m_state.MATHP;
-    case SUZY_MATHN:       // 0xFC57
-        return m_state.MATHN;
-    case SUZY_MATHH:       // 0xFC60
-        return m_state.MATHH;
-    case SUZY_MATHG:       // 0xFC61
-        return m_state.MATHG;
-    case SUZY_MATHF:       // 0xFC62
-        return m_state.MATHF;
-    case SUZY_MATHE:       // 0xFC63
-        return m_state.MATHE;
-    case SUZY_MATHM:       // 0xFC6C
-        return m_state.MATHM;
-    case SUZY_MATHL:       // 0xFC6D
-        return m_state.MATHL;
-    case SUZY_MATHK:       // 0xFC6E
-        return m_state.MATHK;
-    case SUZY_MATHJ:       // 0xFC6F
-        return m_state.MATHJ;
     case SUZY_SPRCTL0:     // 0xFC80
         DebugSuzy("Reading write-only SPRCTL0: %02X", m_state.SPRCTL0);
         return 0xFF;
@@ -205,10 +195,37 @@ INLINE u8 Suzy::Read(u16 address)
         return m_input->ReadSwitches();
     case SUZY_RCART0:      // 0xFCB2
         //DebugSuzy("Reading RCART0");
-        return m_media->ReadBank0();
+        if (!debug)
+        {
+            m_bus->InjectCycles(k_bus_cycles_cart_read);
+            if (m_media->GetAudin() && m_media->GetAudinValue())
+                return m_media->ReadBank0A();
+            else
+                return m_media->ReadBank0();
+        }
+        else
+        {
+            if (m_media->GetAudin() && m_media->GetAudinValue())
+                return m_media->PeekBank0A();
+            else
+                return m_media->PeekBank0();
+        }
     case SUZY_RCART1:      // 0xFCB3
         DebugSuzy("Reading RCART1");
-        return m_media->ReadBank1();
+        if (!debug)
+        {
+            if (m_media->GetAudin() && m_media->GetAudinValue())
+                return m_media->ReadBank1A();
+            else
+                return m_media->ReadBank1();
+        }
+        else
+        {
+            if (m_media->GetAudin() && m_media->GetAudinValue())
+                return m_media->PeekBank1A();
+            else
+                return m_media->PeekBank1();
+        }
     case SUZY_LEDS:        // 0xFCC0
         DebugSuzy("Reading LEDS (unused)");
         return 0xFF;
@@ -229,9 +246,98 @@ INLINE u8 Suzy::Read(u16 address)
     return 0xFF;
 }
 
+template<bool debug>
 INLINE void Suzy::Write(u16 address, u8 value)
 {
-    m_bus->InjectCycles(5);
+    if (!debug)
+    {
+        m_bus->InjectCycles(k_bus_cycles_suzy_write);
+    }
+
+    if ((address >= 0xFC30 && address <= 0xFC3F) || (address >= 0xFC70 && address <= 0xFC7F))
+    {
+        return;
+    }
+
+    // Math registers (FC40-FC6F)
+    if (address >= 0xFC40 && address <= 0xFC6F)
+    {
+        switch(address)
+        {
+        case SUZY_MATHD:       // 0xFC52
+            REG_MATHD = value;
+            value = 0;
+            FALLTHROUGH;
+        case SUZY_MATHC:       // 0xFC53
+            REG_MATHC = value;
+            if (m_state.sprsys_sign)
+            {
+                u16 cd = m_state.SPRDLINE.value;
+                m_state.math_sign_C = MathIsNegative(cd);
+                if (m_state.math_sign_C && cd != 0)
+                    cd = (u16)(-((s16)cd));
+                m_state.SPRDLINE.value = cd;
+            }
+            return;
+        case SUZY_MATHB:       // 0xFC54
+            REG_MATHB = value;
+            REG_MATHA = 0;
+            return;
+        case SUZY_MATHA:       // 0xFC55
+            REG_MATHA = value;
+            if (m_state.sprsys_sign)
+            {
+                u16 ab = m_state.HPOSSTRT.value;
+                m_state.math_sign_A = MathIsNegative(ab);
+                if (m_state.math_sign_A && ab != 0)
+                    ab = (u16)(-((s16)ab));
+                m_state.HPOSSTRT.value = ab;
+            }
+            MathRunMultiply();
+            return;
+        case SUZY_MATHP:       // 0xFC56
+            REG_MATHP = value;
+            REG_MATHN = 0;
+            return;
+        case SUZY_MATHN:       // 0xFC57
+            REG_MATHN = value;
+            return;
+        case SUZY_MATHH:       // 0xFC60
+            REG_MATHH = value;
+            REG_MATHG = 0;
+            return;
+        case SUZY_MATHG:       // 0xFC61
+            REG_MATHG = value;
+            return;
+        case SUZY_MATHF:       // 0xFC62
+            REG_MATHF = value;
+            REG_MATHE = 0;
+            return;
+        case SUZY_MATHE:       // 0xFC63
+            REG_MATHE = value;
+            MathRunDivide();
+            return;
+        case SUZY_MATHM:       // 0xFC6C
+            REG_MATHM = value;
+            REG_MATHL = 0;
+            m_state.sprsys_mathbit = false;
+            return;
+        case SUZY_MATHL:       // 0xFC6D
+            REG_MATHL = value;
+            return;
+        case SUZY_MATHK:       // 0xFC6E
+            REG_MATHK = value;
+            REG_MATHJ = 0;
+            return;
+        case SUZY_MATHJ:       // 0xFC6F
+            REG_MATHJ = value;
+            return;
+        default:
+            // Other addresses that aren't math registers
+            address -= 0x40;
+            break;
+        }
+    }
 
     switch(address)
     {
@@ -391,76 +497,6 @@ INLINE void Suzy::Write(u16 address, u8 value)
     case SUZY_PROCADRH:    // 0xFC2F
         m_state.PROCADR.high = value;
         break;
-    case SUZY_MATHD:       // 0xFC52
-        m_state.MATHD = value;
-        value = 0;
-        FALLTHROUGH;
-    case SUZY_MATHC:       // 0xFC53
-        m_state.MATHC = value;
-        if (m_state.sprsys_sign)
-        {
-            u16 cd = (u16(m_state.MATHC) << 8) | m_state.MATHD;
-            m_state.math_sign_C = MathIsNegative(cd);
-            if (m_state.math_sign_C && cd != 0)
-                cd = (u16)(-((s16)cd));
-            m_state.MATHC = (cd >> 8) & 0xFF;
-            m_state.MATHD = cd & 0xFF;
-        }
-        break;
-    case SUZY_MATHB:       // 0xFC54
-        m_state.MATHB = value;
-        m_state.MATHA = 0;
-        break;
-    case SUZY_MATHA:       // 0xFC55
-        m_state.MATHA = value;
-        if (m_state.sprsys_sign)
-        {
-            u16 ab = (u16(m_state.MATHA) << 8) | m_state.MATHB;
-            m_state.math_sign_A = MathIsNegative(ab);
-            if (m_state.math_sign_A && ab != 0)
-                ab = (u16)(-((s16)ab));
-            m_state.MATHA = (ab >> 8) & 0xFF;
-            m_state.MATHB = ab & 0xFF;
-        }
-        MathRunMultiply();
-        break;
-    case SUZY_MATHP:       // 0xFC56
-        m_state.MATHP = value;
-        m_state.MATHN = 0;
-        break;
-    case SUZY_MATHN:       // 0xFC57
-        m_state.MATHN = value;
-        break;
-    case SUZY_MATHH:       // 0xFC60
-        m_state.MATHH = value;
-        m_state.MATHG = 0;
-        break;
-    case SUZY_MATHG:       // 0xFC61
-        m_state.MATHG = value;
-        break;
-    case SUZY_MATHF:       // 0xFC62
-        m_state.MATHF = value;
-        m_state.MATHE = 0;
-        break;
-    case SUZY_MATHE:       // 0xFC63
-        m_state.MATHE = value;
-        MathRunDivide();
-        break;
-    case SUZY_MATHM:       // 0xFC6C
-        m_state.MATHM = value;
-        m_state.MATHL = 0;
-        m_state.sprsys_mathbit = false;
-        break;
-    case SUZY_MATHL:       // 0xFC6D
-        m_state.MATHL = value;
-        break;
-    case SUZY_MATHK:       // 0xFC6E
-        m_state.MATHK = value;
-        m_state.MATHJ = 0;
-        break;
-    case SUZY_MATHJ:       // 0xFC6F
-        m_state.MATHJ = value;
-        break;
     case SUZY_SPRCTL0:     // 0xFC80
         DebugSuzy("Setting SPRCTL0 to %02X (was %02X)", value, m_state.SPRCTL0);
         m_state.SPRCTL0 = value;
@@ -511,11 +547,17 @@ INLINE void Suzy::Write(u16 address, u8 value)
         break;
     case SUZY_RCART0:      // 0xFCB2
         DebugSuzy("Writing to RCART0: %02X", value);
-        m_media->WriteBank0(value);
+        if (m_media->GetAudin() && m_media->GetAudinValue())
+            m_media->WriteBank0A(value);
+        else
+            m_media->WriteBank0(value);
         break;
     case SUZY_RCART1:      // 0xFCB3
         DebugSuzy("Writing to RCART1: %02X", value);
-        m_media->WriteBank1(value);
+        if (m_media->GetAudin() && m_media->GetAudinValue())
+            m_media->WriteBank1A(value);
+        else
+            m_media->WriteBank1(value);
         break;
     case SUZY_LEDS:        // 0xFCC0
         DebugSuzy("Writing to LEDS (unused): %02X", value);
@@ -559,6 +601,12 @@ INLINE void Suzy::SpritesGo()
     }
 
     DebugSuzy("SpritesGo finished: total cycles = %d", m_state.sprite_cycles);
+
+    if (m_state.sprite_cycles == 0)
+    {
+        m_state.sprsys_spritesbusy = false;
+        m_state.SPRGO = UNSET_BIT(m_state.SPRGO, 0);
+    }
 }
 
 INLINE void Suzy::DrawSprite()
@@ -573,7 +621,7 @@ INLINE void Suzy::DrawSprite()
     m_state.SPRCOLL = RamRead(m_state.TMPADR.value++);
     m_state.SCBNEXT.value = RamReadWord(m_state.TMPADR.value);
     m_state.TMPADR.value += 2;
-    m_state.sprite_cycles += 5;
+    m_state.sprite_cycles += 5 * k_suzy_ticks_ram_read;  // 5 bytes from SCB header
 
     if (IS_SET_BIT(m_state.SPRCTL1, 2))
     {
@@ -613,7 +661,7 @@ INLINE void Suzy::DrawSprite()
     m_state.TMPADR.value += 2;
     m_state.VPOSSTRT.value = RamReadWord(m_state.TMPADR.value);
     m_state.TMPADR.value += 2;
-    m_state.sprite_cycles += 6;
+    m_state.sprite_cycles += 6 * k_suzy_ticks_ram_read;  // 6 bytes for position data
 
     m_state.STRETCH.value = 0;
     m_state.TILT.value = 0;
@@ -624,7 +672,7 @@ INLINE void Suzy::DrawSprite()
         m_state.TMPADR.value += 2;
         m_state.SPRVSIZ.value = RamReadWord(m_state.TMPADR.value);
         m_state.TMPADR.value += 2;
-        m_state.sprite_cycles += 4;
+        m_state.sprite_cycles += 4 * k_suzy_ticks_ram_read;  // 4 bytes for size
     }
     else if (reload_depth == 2)
     {
@@ -634,7 +682,7 @@ INLINE void Suzy::DrawSprite()
         m_state.TMPADR.value += 2;
         m_state.STRETCH.value = RamReadWord(m_state.TMPADR.value);
         m_state.TMPADR.value += 2;
-        m_state.sprite_cycles += 6;
+        m_state.sprite_cycles += 6 * k_suzy_ticks_ram_read;  // 6 bytes for size+stretch
     }
     else if (reload_depth == 3)
     {
@@ -646,14 +694,14 @@ INLINE void Suzy::DrawSprite()
         m_state.TMPADR.value += 2;
         m_state.TILT.value = RamReadWord(m_state.TMPADR.value);
         m_state.TMPADR.value += 2;
-        m_state.sprite_cycles += 8;
+        m_state.sprite_cycles += 8 * k_suzy_ticks_ram_read;  // 8 bytes for size+stretch+tilt
     }
 
     if (reload_palette)
     {
         int colors = 1 << bpp;
         int bytes_to_read = colors >> 1;
-        m_state.sprite_cycles += bytes_to_read;
+        m_state.sprite_cycles += bytes_to_read * k_suzy_ticks_ram_read;  // palette bytes
 
         for (int i = 0; i < bytes_to_read; ++i)
         {
@@ -681,12 +729,12 @@ INLINE void Suzy::DrawSprite()
     s32 dy = pos.up ? -1 : +1;
 
     s32 cur_y = base_vpos;
-    m_state.VSIZACUM.value = pos.up ? 0 : m_state.VSIZOFF.value; // 8.8 accumulator persistente en registro
+    m_state.VSIZACUM.value = m_state.VSIZOFF.value;
 
-    while (m_state.SPRDLINE.value != 0)
+    while (true)
     {
         u8 sprdoff  = RamRead(m_state.SPRDLINE.value);
-        m_state.sprite_cycles += 1;
+        m_state.sprite_cycles += k_suzy_ticks_ram_read;  // sprdoff byte
         u16 next_ptr = (u16)(m_state.SPRDLINE.value + (u16)sprdoff);
 
         u16 data_begin = (u16)(m_state.SPRDLINE.value + 1);
@@ -703,7 +751,7 @@ INLINE void Suzy::DrawSprite()
             if (pos.left != start_pos.left)
                 start_x += dx;
 
-            u32 haccum_init = pos.left ? 0u : m_state.HSIZOFF.value;
+            u32 haccum_init = m_state.HSIZOFF.value;
 
             if (literal_only)
             {
@@ -717,7 +765,7 @@ INLINE void Suzy::DrawSprite()
             cur_y += dy;
 
             m_state.TILTACUM.value = (u16)(m_state.TILTACUM.value + m_state.TILT.value);
-            s32 tilt_carry = (s16)m_state.TILTACUM.value >> 8; // desplazamiento aritmético (tilt con signo)
+            s32 tilt_carry = (s16)m_state.TILTACUM.value >> 8;
             base_hpos += tilt_carry;
             m_state.TILTACUM.value &= 0x00FF;
 
@@ -745,7 +793,7 @@ INLINE void Suzy::DrawSprite()
             dy = pos.up   ? -1 : +1;
 
             cur_y  = base_vpos;
-            m_state.VSIZACUM.value = pos.up ? 0 : m_state.VSIZOFF.value;
+            m_state.VSIZACUM.value = m_state.VSIZOFF.value;
 
             if (pos.up != start_pos.up)
                 cur_y += dy;
@@ -788,6 +836,7 @@ INLINE void Suzy::DrawSpriteLineLiteral(u16 data_begin, u16 data_end,
     ShiftRegisterReset(data_begin);
 
     u32 h_accum = haccum_init;
+    bool render = ((u32)y < (u32)GLYNX_SCREEN_HEIGHT);
 
     while (m_state.shift_register_address < data_end)
     {
@@ -798,12 +847,26 @@ INLINE void Suzy::DrawSpriteLineLiteral(u16 data_begin, u16 data_end,
         u8 pen = m_state.pen_map[pi & 0x0F];
 
         h_accum += (u32)hsiz;
+        s32 pixel_count = (s32)(h_accum >> 8);
+        h_accum &= 0xFF;
 
-        while (h_accum >= 0x100)
+        if (pixel_count > 0)
         {
-            DrawPixel(x, y, pen, type, collide, collision_id);
-            x += dx;
-            h_accum -= 0x100;
+            if (render)
+            {
+                for (s32 p = 0; p < pixel_count; ++p)
+                {
+                    DrawPixel(x, y, pen, type, collide, collision_id);
+                    x += dx;
+                }
+
+                if ((dx > 0 && x >= GLYNX_SCREEN_WIDTH) || (dx < 0 && x < 0))
+                    render = false;
+            }
+            else
+            {
+                x += dx * pixel_count;
+            }
         }
     }
 }
@@ -815,6 +878,7 @@ INLINE void Suzy::DrawSpriteLinePacked(u16 data_begin, u16 data_end,
     ShiftRegisterReset(data_begin);
 
     u32 h_accum = haccum_init;
+    bool render = ((u32)y < (u32)GLYNX_SCREEN_HEIGHT);
 
     while (m_state.shift_register_address < data_end)
     {
@@ -836,11 +900,26 @@ INLINE void Suzy::DrawSpriteLinePacked(u16 data_begin, u16 data_end,
                 u8 pen = m_state.pen_map[pi & 0x0F];
 
                 h_accum += (u32)hsiz;
-                while (h_accum >= 0x100)
+                s32 pixel_count = (s32)(h_accum >> 8);
+                h_accum &= 0xFF;
+
+                if (pixel_count > 0)
                 {
-                    DrawPixel(x, y, pen, type, collide, collision_id);
-                    x += dx;
-                    h_accum -= 0x100;
+                    if (render)
+                    {
+                        for (s32 p = 0; p < pixel_count; ++p)
+                        {
+                            DrawPixel(x, y, pen, type, collide, collision_id);
+                            x += dx;
+                        }
+
+                        if ((dx > 0 && x >= GLYNX_SCREEN_WIDTH) || (dx < 0 && x < 0))
+                            render = false;
+                    }
+                    else
+                    {
+                        x += dx * pixel_count;
+                    }
                 }
             }
         }
@@ -855,11 +934,26 @@ INLINE void Suzy::DrawSpriteLinePacked(u16 data_begin, u16 data_end,
             while (count--)
             {
                 h_accum += (u32)hsiz;
-                while (h_accum >= 0x100)
+                s32 pixel_count = (s32)(h_accum >> 8);
+                h_accum &= 0xFF;
+
+                if (pixel_count > 0)
                 {
-                    DrawPixel(x, y, pen, type, collide, collision_id);
-                    x += dx;
-                    h_accum -= 0x100;
+                    if (render)
+                    {
+                        for (s32 p = 0; p < pixel_count; ++p)
+                        {
+                            DrawPixel(x, y, pen, type, collide, collision_id);
+                            x += dx;
+                        }
+
+                        if ((dx > 0 && x >= GLYNX_SCREEN_WIDTH) || (dx < 0 && x < 0))
+                            render = false;
+                    }
+                    else
+                    {
+                        x += dx * pixel_count;
+                    }
                 }
             }
         }
@@ -950,7 +1044,7 @@ INLINE void Suzy::DrawPixel(s32 x, s32 y, u8 pen, int type, bool collide, u8 col
             if (is_left)
             {
                 back = (u8)((back & 0x0F) | (collision_id << 4));
-                m_state.sprite_cycles += 2;
+                m_state.sprite_cycles += k_suzy_ticks_rmw + k_suzy_ticks_process;  // left pixel: R-M-W + processing
             }
             else
                 back = (u8)((back & 0xF0) | (collision_id & 0x0F));
@@ -972,7 +1066,7 @@ INLINE void Suzy::DrawPixel(s32 x, s32 y, u8 pen, int type, bool collide, u8 col
             {
                 new_nib ^= (u8)((video_byte >> 4) & 0x0F);
                 video_byte = (u8)((video_byte & 0x0F) | ((new_nib & 0x0F) << 4));
-                m_state.sprite_cycles += 2;
+                m_state.sprite_cycles += k_suzy_ticks_rmw + k_suzy_ticks_process;  // XOR left pixel: R-M-W + processing
             }
             else
             {
@@ -985,7 +1079,7 @@ INLINE void Suzy::DrawPixel(s32 x, s32 y, u8 pen, int type, bool collide, u8 col
             if (is_left)
             {
                 video_byte = (u8)((video_byte & 0x0F) | ((new_nib & 0x0F) << 4));
-                m_state.sprite_cycles += 2;
+                m_state.sprite_cycles += k_suzy_ticks_rmw + k_suzy_ticks_process;  // normal left pixel: R-M-W + processing
             }
             else
                 video_byte = (u8)((video_byte & 0xF0) | (new_nib & 0x0F));
@@ -1015,7 +1109,7 @@ INLINE void Suzy::ShiftRegisterReset(u16 address)
     m_state.shift_register_address = address;
     m_state.shift_register_current = RamRead(address);
     m_state.shift_register_bit = 7;
-    m_state.sprite_cycles += 1;
+    m_state.sprite_cycles += k_suzy_ticks_ram_read;  // initial sprite data byte
 }
 
 INLINE u32 Suzy::ShiftRegisterGetBits(int n, u16 stop_addr)
@@ -1042,7 +1136,7 @@ INLINE u32 Suzy::ShiftRegisterGetBits(int n, u16 stop_addr)
             m_state.shift_register_address++;
             m_state.shift_register_current = RamRead(m_state.shift_register_address);
             m_state.shift_register_bit = 7;
-            m_state.sprite_cycles += 1;
+            m_state.sprite_cycles += k_suzy_ticks_ram_read;  // next sprite data byte
         }
 
         value = (value << 1) | ((m_state.shift_register_current >> m_state.shift_register_bit) & 1);

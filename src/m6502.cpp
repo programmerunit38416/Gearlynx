@@ -23,26 +23,40 @@
 #include <string.h>
 #include <assert.h>
 #include "m6502.h"
+#include "m6502_timing.h"
+#include "bus.h"
 #include "memory.h"
 #include "state_serializer.h"
 
-M6502::M6502()
+M6502::M6502(Bus* bus)
 {
+    m_bus = bus;
     InitPointer(m_memory);
-    InitOPCodeFunctors();
+    m_opcode_cycles = k_m6502_opcode_cycles_lynx2;
+    m_opcode_sizes = k_m6502_opcode_sizes_lynx2;
     m_s.cycles = 0;
+    m_s.memory_accesses = 0;
     m_s.irq_asserted = false;
     m_s.irq_pending = 0;
     m_s.debug_next_irq = 0;
     m_s.debug_irq_mask = 0;
     m_s.halted = false;
+    m_s.onebyte_un_nop = false;
+    m_s.page_mode_discounts = 0;
+    m_s.last_ticks = 0;
+    m_s.total_ticks = 0;
     m_breakpoints_enabled = false;
     m_breakpoints_irq_enabled = 0;
     m_cpu_breakpoint_hit = false;
     m_memory_breakpoint_hit = false;
     m_run_to_breakpoint_hit = false;
     m_run_to_breakpoint_requested = false;
+    m_skip_irq_on_step = false;
+    m_disassembler_call_stack_size = 0;
     m_reset_value = -1;
+    m_prev_opcode_address = 0xFFFF;
+    m_stream_open = false;
+    m_page_mode_tick_discount = 0;
 }
 
 M6502::~M6502()
@@ -55,8 +69,10 @@ void M6502::Init(Memory* memory)
     CreateZNFlagsTable();
 }
 
-void M6502::Reset()
+void M6502::Reset(bool is_lynx2)
 {
+    InitOPCodeFunctors(is_lynx2);
+
     m_s.PC.SetLow(m_memory->Read(0xFFFC));
     m_s.PC.SetHigh(m_memory->Read(0xFFFD));
     m_s.debug_next_irq = 1;
@@ -83,14 +99,22 @@ void M6502::Reset()
     ClearFlag(FLAG_DECIMAL);
 
     m_s.cycles = 0;
+    m_s.memory_accesses = 0;
     m_s.irq_asserted = false;
     m_s.irq_pending = 0;
     m_s.debug_irq_mask = 0;
     m_s.halted = false;
+    m_s.onebyte_un_nop = false;
+    m_s.page_mode_discounts = 0;
+    m_s.last_ticks = 0;
+    m_s.total_ticks = 0;
     m_cpu_breakpoint_hit = false;
     m_memory_breakpoint_hit = false;
     m_run_to_breakpoint_hit = false;
     m_run_to_breakpoint_requested = false;
+    m_prev_opcode_address = 0xFFFF;
+    m_stream_open = false;
+    m_page_mode_tick_discount = 0;
     ClearDisassemblerCallStack();
 }
 
@@ -243,6 +267,7 @@ void M6502::ClearDisassemblerCallStack()
 {
     while(!m_disassembler_call_stack.empty())
         m_disassembler_call_stack.pop();
+    m_disassembler_call_stack_size = 0;
 }
 
 void M6502::CheckMemoryBreakpoints(u16 address, bool read)
@@ -330,9 +355,14 @@ void M6502::LoadState(std::istream& stream)
 void M6502::Serialize(StateSerializer& s)
 {
     G_SERIALIZE(s, m_s.cycles);
+    G_SERIALIZE(s, m_s.memory_accesses);
     G_SERIALIZE(s, m_s.irq_asserted);
     G_SERIALIZE(s, m_s.irq_pending);
     G_SERIALIZE(s, m_s.debug_next_irq);
     G_SERIALIZE(s, m_s.debug_irq_mask);
     G_SERIALIZE(s, m_s.halted);
+    G_SERIALIZE(s, m_s.onebyte_un_nop);
+    G_SERIALIZE(s, m_s.page_mode_discounts);
+    G_SERIALIZE(s, m_stream_open);
+    G_SERIALIZE(s, m_page_mode_tick_discount);
 }

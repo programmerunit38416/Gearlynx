@@ -47,6 +47,7 @@ GearlynxCore::GearlynxCore()
     InitPointer(m_mikey);
     InitPointer(m_debug_callback);
     m_paused = true;
+    m_total_cycles = 0;
 }
 
 GearlynxCore::~GearlynxCore()
@@ -68,12 +69,12 @@ void GearlynxCore::Init(GLYNX_Pixel_Format pixel_format)
     srand((unsigned int)time(NULL));
 
     m_media = new Media();
-    m_m6502 = new M6502();
     m_bus = new Bus();
+    m_m6502 = new M6502(m_bus);
     m_input = new Input(m_media);
     m_suzy = new Suzy(m_media, m_m6502, m_input, m_bus);
     m_mikey = new Mikey(m_suzy, m_media, m_m6502, m_bus);
-    m_memory = new Memory(m_media, m_input, m_suzy, m_mikey, m_m6502);
+    m_memory = new Memory(m_media, m_input, m_suzy, m_mikey, m_m6502, m_bus);
     m_audio = new Audio(m_mikey);
 
     m_media->Init();
@@ -120,7 +121,7 @@ bool GearlynxCore::GetRuntimeInfo(GLYNX_Runtime_Info& runtime_info)
 {
     GLYNX_Rotation rotation = m_media->GetRotation();
 
-    if (rotation == ROTATE_LEFT || rotation == ROTATE_RIGHT)
+    if (rotation == GLYNX_ROTATION_LEFT || rotation == GLYNX_ROTATION_RIGHT)
     {
         runtime_info.screen_width = GLYNX_SCREEN_HEIGHT;
         runtime_info.screen_height = GLYNX_SCREEN_WIDTH;
@@ -146,6 +147,11 @@ bool GearlynxCore::GetRuntimeInfo(GLYNX_Runtime_Info& runtime_info)
 void GearlynxCore::SetDebugCallback(GLYNX_Debug_Callback callback)
 {
     m_debug_callback = callback;
+}
+
+u64 GearlynxCore::GetTotalCycles()
+{
+    return m_total_cycles;
 }
 
 void GearlynxCore::KeyPressed(GLYNX_Keys key)
@@ -179,40 +185,133 @@ bool GearlynxCore::IsPaused()
 
 void GearlynxCore::ResetROM(bool preserve_ram)
 {
-    UNUSED(preserve_ram);
-
     if (!m_media->IsReady())
         return;
+
+    using namespace std;
+    stringstream stream;
+
+    if (preserve_ram)
+        m_media->SaveRam(stream);
 
     Log("Gearlynx RESET");
     Reset();
     m_m6502->DisassembleNextOPCode();
+
+    if (preserve_ram)
+    {
+        stream.seekg(0, stream.end);
+        s32 size = (s32)stream.tellg();
+        stream.seekg(0, stream.beg);
+        m_media->LoadRam(stream, size);
+    }
 }
 
 void GearlynxCore::ResetSound()
 {
-    m_audio->Reset();
+    bool is_lynx2 = (m_media->GetConsoleType() != GLYNX_CONSOLE_MODEL_I);
+    m_audio->Reset(is_lynx2);
 }
 
-// void GearlynxCore::SaveRam()
-// {
-//     SaveRam(NULL);
-// }
+void GearlynxCore::SaveRam()
+{
+    SaveRam(NULL);
+}
 
-// void GearlynxCore::SaveRam(const char*, bool)
-// {
-//     // TODO Implement save ram
-// }
+void GearlynxCore::SaveRam(const char* path, bool full_path)
+{
+    if (m_media->IsReady() && m_media->IsSaveMemoryDirty())
+    {
+        using namespace std;
+        string final_path;
 
-// void GearlynxCore::LoadRam()
-// {
-//     LoadRam(NULL);
-// }
+        if (IsValidPointer(path))
+        {
+            final_path = path;
+            if (!full_path)
+            {
+                final_path += "/";
+                final_path += m_media->GetFileName();
+            }
+        }
+        else
+            final_path = m_media->GetFilePath();
 
-// void GearlynxCore::LoadRam(const char*, bool)
-// {
-//     // TODO Implement load ram
-// }
+        if (!full_path)
+        {
+            string::size_type i = final_path.rfind('.', final_path.length());
+            if (i != string::npos)
+                final_path.replace(i, final_path.length() - i, ".sav");
+        }
+
+        Log("Saving RAM file: %s", final_path.c_str());
+
+        ofstream file;
+        open_ofstream_utf8(file, final_path.c_str(), ios::out | ios::binary);
+        m_media->SaveRam(file);
+
+        Debug("RAM saved");
+    }
+}
+
+void GearlynxCore::LoadRam()
+{
+    LoadRam(NULL);
+}
+
+void GearlynxCore::LoadRam(const char* path, bool full_path)
+{
+    if (m_media->IsReady())
+    {
+        using namespace std;
+        string final_path;
+
+        if (IsValidPointer(path))
+        {
+            final_path = path;
+            if (!full_path)
+            {
+                final_path += "/";
+                final_path += m_media->GetFileName();
+            }
+        }
+        else
+            final_path = m_media->GetFilePath();
+
+        if (!full_path)
+        {
+            string::size_type i = final_path.rfind('.', final_path.length());
+            if (i != string::npos)
+                final_path.replace(i, final_path.length() - i, ".sav");
+        }
+
+        Log("Loading RAM file: %s", final_path.c_str());
+
+        ifstream file;
+        open_ifstream_utf8(file, final_path.c_str(), ios::in | ios::binary);
+
+        if (!file.fail())
+        {
+            file.seekg(0, file.end);
+            s32 file_size = (s32)file.tellg();
+            file.seekg(0, file.beg);
+
+            if (m_media->LoadRam(file, file_size))
+            {
+                Debug("RAM loaded");
+            }
+            else
+            {
+                Error("Failed to load RAM from %s", final_path.c_str());
+                Error("Invalid RAM size: %d", file_size);
+            }
+        }
+        else
+        {
+            Log("RAM file doesn't exist: %s", final_path.c_str());
+        }
+    }
+}
 
 std::string GearlynxCore::GetSaveStatePath(const char* path, int index)
 {
@@ -357,10 +456,10 @@ bool GearlynxCore::SaveState(std::ostream& stream, size_t& size, bool screenshot
             header.screenshot_height = runtime_info.screen_height;
 
             int bytes_per_pixel = 2;
-            if (m_mikey->GetPixelFormat() == GLYNX_PIXEL_RGBA8888)
+            if (m_mikey->GetLcdScreen()->GetPixelFormat() == GLYNX_PIXEL_RGBA8888)
                 bytes_per_pixel = 4;
 
-            u8* frame_buffer = m_mikey->GetBuffer();
+            u8* frame_buffer = m_mikey->GetLcdScreen()->GetBuffer();
 
             header.screenshot_size = header.screenshot_width * header.screenshot_height * bytes_per_pixel;
             stream.write(reinterpret_cast<const char*>(frame_buffer), header.screenshot_size);
@@ -614,17 +713,21 @@ bool GearlynxCore::GetSaveStateScreenshot(int index, const char* path, GLYNX_Sav
 void GearlynxCore::Reset()
 {
     m_paused = false;
+    m_total_cycles = 0;
 
     m_media->Reset();
+
+    bool is_lynx2 = (m_media->GetConsoleType() == GLYNX_CONSOLE_MODEL_II);
+
     m_suzy->Reset();
-    m_mikey->Reset();
-    m_memory->Reset();
-    m_m6502->Reset();
-    m_audio->Reset();
+    m_mikey->Reset(is_lynx2);
+    m_memory->Reset(is_lynx2);
+    m_m6502->Reset(is_lynx2);
+    m_audio->Reset(is_lynx2);
     m_bus->Reset();
     m_input->Reset();
 
-    if (m_media->GetType() == Media::MEDIA_HOMEBREW)
+    if (m_media->GetType() != Media::MEDIA_LYNX)
         PrepareForHomebrew();
 }
 
@@ -633,31 +736,64 @@ void GearlynxCore::PrepareForHomebrew()
     u16 boot_address = m_media->GetHomebrewBootAddress();
     int size = m_media->GetROMSize();
 
-    if (size <= 0)
-        return;
-
     u8* ram = m_memory->GetRAM();
-    u8* rom = m_media->GetROM();
-
     const int ram_size = 0x10000;
-    const int start = (int)boot_address;
-    const int first = MIN(size, ram_size - start);
-    const int left  = size - first;
 
     memset(ram, 0, ram_size);
 
-    if (first > 0)
-        memcpy(ram + start, rom, first);
-    if (left  > 0)
-        memcpy(ram, rom + first, MIN(left, ram_size));
+    M6502::M6502_State* cpu = m_m6502->GetState();
+    cpu->A.SetValue(0x00);
+    cpu->X.SetValue(0x00);
+    cpu->Y.SetValue(0x00);
+    cpu->S.SetValue(0xFF);
+    cpu->P.SetValue(0x34);
 
-    m_m6502->GetState()->PC.SetValue(boot_address);
+    if (m_media->GetType() == Media::MEDIA_EPYX_HEADERLESS)
+    {
+        u8 decrypted[256];
+        int decrypted_size = m_media->DecryptEpyxLoader(decrypted, sizeof(decrypted));
+
+        if (decrypted_size > 0)
+        {
+            Debug("EPYX headerless: copying %d decrypted bytes to 0x%04X", decrypted_size, boot_address);
+            memcpy(ram + boot_address, decrypted, decrypted_size);
+        }
+        else
+        {
+            Error("EPYX headerless decryption failed");
+            return;
+        }
+    }
+    else
+    {
+        // For BS93 homebrew: copy ROM directly to RAM at boot address
+        if (size <= 0)
+            return;
+
+        u8* rom = m_media->GetROM();
+
+        const int start = (int)boot_address;
+        const int first = MIN(size, ram_size - start);
+        const int left  = size - first;
+
+        if (first > 0)
+            memcpy(ram + start, rom, first);
+        if (left  > 0)
+            memcpy(ram, rom + first, MIN(left, ram_size));
+    }
+
+    cpu->PC.SetValue(boot_address);
     m_m6502->DisassembleNextOPCode();
 
-    m_mikey->GetState()->timers[0].backup = 0x9E;
-    m_mikey->GetState()->timers[0].control_a = 0x18;
-    m_mikey->GetState()->timers[2].backup = 0x68;
-    m_mikey->GetState()->timers[2].control_a = 0x1F;
+    m_mikey->Write(MIKEY_TIM0BKUP, 0x9E);
+    m_mikey->Write(MIKEY_TIM0CTLA, 0x18);
+    m_mikey->Write(MIKEY_TIM2BKUP, 0x68);
+    m_mikey->Write(MIKEY_TIM2CTLA, 0x1F);
+    m_mikey->Write(MIKEY_DISPCTL, 0x09);
+    m_mikey->Write(MIKEY_PBKUP, 0x29);
 
-    m_mikey->GetState()->DISPCTL = 0x09;
+    for (int address = 0xFDA0; address < 0xFDC0; address++)
+        m_mikey->Write(address, 0x00);
+
+    m_memory->Write(0xFFF9, 0x0C);
 }

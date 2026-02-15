@@ -41,6 +41,7 @@
 
 class Memory;
 class StateSerializer;
+class Bus;
 
 class M6502
 {
@@ -54,11 +55,16 @@ public:
         EightBitRegister S;
         EightBitRegister P;
         u32 cycles;
+        u32 memory_accesses;
         bool irq_asserted;
         bool irq_pending;
         s32 debug_next_irq;
         s32 debug_irq_mask;
         bool halted;
+        bool onebyte_un_nop;
+        u8 page_mode_discounts;
+        u32 last_ticks;
+        u64 total_ticks;
     };
 
     struct GLYNX_Breakpoint
@@ -80,10 +86,10 @@ public:
     };
 
 public:
-    M6502();
+    M6502(Bus* bus);
     ~M6502();
     void Init(Memory* memory);
-    void Reset();
+    void Reset(bool is_lynx2);
     u32 RunInstruction();
     void AssertIRQ(bool asserted, u8 irq_mask);
     void Halt(bool halted);
@@ -91,8 +97,11 @@ public:
     void InjectCycles(unsigned int cycles);
     M6502_State* GetState();
     void DisassembleNextOPCode();
+    void DisassembleAhead(int count);
+    void DisassembleAhead(u16 start_address, int count, int depth);
     void SetResetValue(int value);
     void EnableBreakpoints(bool enable, u8 irqs);
+    void SetSkipIRQOnStep(bool skip);
     bool BreakpointHit();
     bool RunToBreakpointHit();
     void ResetBreakpoints();
@@ -105,14 +114,18 @@ public:
     void ClearDisassemblerCallStack();
     std::stack<GLYNX_CallStackEntry>* GetDisassemblerCallStack();
     void CheckMemoryBreakpoints(u16 address, bool read);
+    void SetPageModeEnabled(bool enabled);
     void SaveState(std::ostream& stream);
     void LoadState(std::istream& stream);
 
 private:
     typedef void (M6502::*opcodeptr) (void);
     opcodeptr m_opcodes[256];
+    const u8* m_opcode_cycles;
+    const u8* m_opcode_sizes;
     u8 m_zn_flags_lut[256];
     Memory* m_memory;
+    Bus* m_bus;
     M6502_State m_s;
     bool m_breakpoints_enabled;
     u8 m_breakpoints_irq_enabled;
@@ -122,8 +135,13 @@ private:
     std::vector<GLYNX_Breakpoint> m_breakpoints;
     GLYNX_Breakpoint m_run_to_breakpoint;
     bool m_run_to_breakpoint_requested;
+    bool m_skip_irq_on_step;
     std::stack<GLYNX_CallStackEntry> m_disassembler_call_stack;
+    int m_disassembler_call_stack_size;
     int m_reset_value;
+    bool m_stream_open;
+    u16 m_prev_opcode_address;
+    u8 m_page_mode_tick_discount;
 
 private:
     void HandleIRQ();
@@ -133,8 +151,12 @@ private:
     void PushCallStack(u16 src, u16 dest, u16 back);
     void PopCallStack();
 
-    u8 Fetch8();
-    u16 Fetch16();
+    u8 FetchOpcode8();
+    u8 FetchOperand8();
+    u16 FetchOperand16();
+    void NotifyBusBreak();
+    u8 MemRead8(u16 address);
+    void MemWrite8(u16 address, u8 value);
     u16 Address16(u8 high, u8 low);
     bool PageCrossed(u16 old_address, u16 new_address);
     u16 ZeroPageX();
@@ -167,6 +189,7 @@ private:
     u16 AbsoluteIndexedIndirectAddressing();
 
     void PopulateDisassemblerRecord(GLYNX_Disassembler_Record* record, u8 opcode, u16 address);
+    void InvalidateOverlappingRecords(u16 address, u8 opcode_size);
 
     void Serialize(StateSerializer& s);
 
@@ -201,8 +224,9 @@ private:
     void OPCodes_Transfer(EightBitRegister* source, EightBitRegister* dest);
     void OPCodes_TRB(u16 address);
     void OPCodes_TSB(u16 address);
+    void OPCodes_LynxI_NOP();
 
-    void InitOPCodeFunctors();
+    void InitOPCodeFunctors(bool is_lynx2);
 
     void OPCode0x00(); void OPCode0x01(); void OPCode0x02(); void OPCode0x03();
     void OPCode0x04(); void OPCode0x05(); void OPCode0x06(); void OPCode0x07();

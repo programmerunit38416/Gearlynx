@@ -17,17 +17,22 @@
  *
  */
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "imgui.h"
-#include "imgui_impl_sdl2.h"
+#include "imgui_impl_sdl3.h"
 #include "gearlynx.h"
 #include "config.h"
 #include "gui.h"
+#include "gui_filedialogs.h"
 #include "gui_debug_disassembler.h"
-#include "renderer.h"
+#include "ogl_renderer.h"
 #include "emu.h"
+#include "display.h"
 #include "utils.h"
 #include "gdb_interface.h"
+#include "single_instance.h"
+#include "gamepad.h"
+#include "events.h"
 
 #define APPLICATION_IMPORT
 #include "application.h"
@@ -38,53 +43,37 @@
 #define WINDOW_TITLE GLYNX_TITLE " " GLYNX_VERSION
 #endif
 
-static SDL_GLContext gl_context = NULL;
 static bool running = true;
 static bool paused_when_focus_lost = false;
-static Uint64 frame_time_start = 0;
-static Uint64 frame_time_end = 0;
-static bool input_gamepad_shortcut_prev[config_HotkeyIndex_COUNT] = { };
-static Uint32 mouse_last_motion_time = 0;
-static const Uint32 mouse_hide_timeout_ms = 1500;
+static Uint64 mouse_last_motion_time = 0;
+static const Uint64 mouse_hide_timeout_ms = 1500;
+static SDL_DisplayID current_display_id = 0;
+
+bool g_mcp_stdio_mode = false;
 
 static bool sdl_init(void);
 static void sdl_destroy(void);
-static void sdl_load_gamepad_mappings(void);
 static void sdl_events(void);
 static void sdl_events_quit(const SDL_Event* event);
 static void sdl_events_app(const SDL_Event* event);
-static void sdl_events_shortcuts_gui(const SDL_Event* event);
-static void sdl_events_emu(const SDL_Event* event);
-static void input_check_gamepad_shortcuts(void);
-static bool input_get_button(SDL_GameController* controller, int mapping);
-static void sdl_add_gamepads(void);
-static void sdl_remove_gamepad(SDL_JoystickID instance_id);
 static void handle_mouse_cursor(void);
 static void handle_menu(void);
+static void handle_single_instance(void);
 static void run_emulator(void);
-static void render(void);
-static void frame_throttle(void);
 static void save_window_size(void);
-static void log_sdl_error(const char* action, const char* file, int line);
-static bool check_hotkey(const SDL_Event* event, const config_Hotkey& hotkey, bool allow_repeat);
 
-#define SDL_ERROR(action) log_sdl_error(action, __FILE__, __LINE__)
 
 #if defined(__APPLE__)
-#include <SDL_syswm.h>
 static void* macos_fullscreen_observer = NULL;
 static void* macos_nswindow = NULL;
 extern "C" void* macos_install_fullscreen_observer(void* nswindow, void(*enter_cb)(), void(*exit_cb)());
 extern "C" void macos_set_native_fullscreen(void* nswindow, bool enter);
 #endif
 
-int application_init(const char* rom_file, const char* symbol_file, bool force_fullscreen, bool force_windowed)
+int application_init(const char* rom_file, const char* symbol_file, bool force_fullscreen, bool force_windowed, int mcp_mode, int mcp_tcp_port)
 {
     Log("\n%s", GLYNX_TITLE_ASCII);
     Log("%s %s Desktop App", GLYNX_TITLE, GLYNX_VERSION);
-
-    config_init();
-    config_read();
 
     application_show_menu = true;
 
@@ -103,28 +92,34 @@ int application_init(const char* rom_file, const char* symbol_file, bool force_f
         return 1;
     }
 
+    if (!gamepad_init())
+    {
+        Error("Failed to initialize gamepad subsystem");
+        return 2;
+    }
+
     if (!emu_init())
     {
         Error("Failed to initialize emulator");
-        return 2;
+        return 3;
     }
 
     if (!gui_init())
     {
         Error("Failed to initialize GUI");
-        return 3;
-    }
-
-    if (!ImGui_ImplSDL2_InitForOpenGL(application_sdl_window, gl_context))
-    {
-        Error("Failed to initialize ImGui for SDL2");
         return 4;
     }
 
-    if (!renderer_init())
+    if (!ImGui_ImplSDL3_InitForOpenGL(application_sdl_window, display_gl_context))
+    {
+        Error("Failed to initialize ImGui for SDL3");
+        return 5;
+    }
+
+    if (!ogl_renderer_init())
     {
         Error("Failed to initialize renderer");
-        return 5;
+        return 6;
     }
 
     if (config_emulator.fullscreen)
@@ -143,42 +138,51 @@ int application_init(const char* rom_file, const char* symbol_file, bool force_f
         gui_debug_load_symbols_file(symbol_file);
     }
 
+    if (mcp_mode >= 0)
+    {
+        Log("Auto-starting MCP server (mode: %s, port: %d)...", mcp_mode == 0 ? "stdio" : "http", mcp_tcp_port);
+        config_debug.debug = true;
+        emu_mcp_set_transport(mcp_mode, mcp_tcp_port);
+        emu_mcp_start();
+    }
+
     return 0;
 }
 
 void application_destroy(void)
 {
     save_window_size();
-    config_write();
     emu_destroy();
-    config_destroy();
-    renderer_destroy();
-    ImGui_ImplSDL2_Shutdown();
+    ogl_renderer_destroy();
+    ImGui_ImplSDL3_Shutdown();
     gui_destroy();
+    gamepad_destroy();
     sdl_destroy();
+    single_instance_destroy();
 }
 
 void application_mainloop(void)
 {
-    Log("Starting main loop...");
+    Log("Running main loop...");
 
     while (running)
     {
-        frame_time_start = SDL_GetPerformanceCounter();
+        display_begin_frame();
         sdl_events();
         handle_mouse_cursor();
         handle_menu();
+        handle_single_instance();
         run_emulator();
-        render();
-        frame_time_end = SDL_GetPerformanceCounter();
-        frame_throttle();
+        display_render();
+        display_frame_throttle();
     }
 }
 
 void application_trigger_quit(void)
 {
     SDL_Event event;
-    event.type = SDL_QUIT;
+    SDL_zero(event);
+    event.type = SDL_EVENT_QUIT;
     SDL_PushEvent(&event);
 }
 
@@ -201,112 +205,120 @@ void application_trigger_fullscreen(bool fullscreen)
 #if defined(__APPLE__)
     macos_set_native_fullscreen(macos_nswindow, fullscreen);
 #else
-    SDL_SetWindowFullscreen(application_sdl_window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-    SDL_ERROR("SDL_SetWindowFullscreen");
+    if (fullscreen)
+    {
+        if (config_emulator.fullscreen_mode == 1)
+        {
+            // Exclusive fullscreen: set a display mode
+            SDL_DisplayID display = SDL_GetDisplayForWindow(application_sdl_window);
+            const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display);
+            SDL_SetWindowFullscreenMode(application_sdl_window, mode);
+        }
+        else
+        {
+            // Borderless fullscreen (default): pass NULL for desktop fullscreen
+            SDL_SetWindowFullscreenMode(application_sdl_window, NULL);
+        }
+
+        SDL_SetWindowFullscreen(application_sdl_window, true);
+        SDL_ERROR("SDL_SetWindowFullscreen");
+    }
+    else
+    {
+        SDL_SetWindowFullscreen(application_sdl_window, false);
+        SDL_ERROR("SDL_SetWindowFullscreen");
+    }
 #endif
+
     mouse_last_motion_time = SDL_GetTicks();
+    display_update_frame_pacing();
 }
 
 void application_trigger_fit_to_content(int width, int height)
 {
-    SDL_SetWindowSize(application_sdl_window, width, height);
+    float content_scale = SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(application_sdl_window));
+    if (content_scale <= 0.0f)
+        content_scale = 1.0f;
+    SDL_SetWindowSize(application_sdl_window, (int)(width * content_scale), (int)(height * content_scale));
     SDL_ERROR("SDL_SetWindowSize");
 }
+
+
 
 void application_update_title_with_rom(const char* rom)
 {
     char final_title[256];
     snprintf(final_title, 256, "%s - %s", WINDOW_TITLE, rom);
     SDL_SetWindowTitle(application_sdl_window, final_title);
-    SDL_ERROR("SDL_SetWindowTitle");
 }
 
-void application_assign_gamepad(int device_index)
+bool application_check_single_instance(const char* rom_file, const char* symbol_file)
 {
-    if (device_index < 0)
+    if (!config_debug.single_instance)
+        return true;
+
+    single_instance_init(GLYNX_TITLE);
+
+    if (!single_instance_try_lock())
     {
-        if (IsValidPointer(application_gamepad))
-        {
-            SDL_GameControllerClose(application_gamepad);
-            application_gamepad = NULL;
-            Debug("Player %d controller set to None");
-        }
-        return;
+        if (rom_file != NULL || symbol_file != NULL)
+            single_instance_send_message(rom_file, symbol_file);
+
+        single_instance_destroy();
+        return false;
     }
 
-    if (device_index >= SDL_NumJoysticks())
-    {
-        Log("Warning: device_index %d out of range", device_index);
-        return;
-    }
-
-    if (!SDL_IsGameController(device_index))
-    {
-        Log("Warning: device_index %d is not a game controller", device_index);
-        return;
-    }
-
-    SDL_JoystickID wanted_id = SDL_JoystickGetDeviceInstanceID(device_index);
-
-    if (IsValidPointer(application_gamepad))
-    {
-        SDL_JoystickID current_id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(application_gamepad));
-        if (current_id == wanted_id)
-            return;
-    }
-
-    if (IsValidPointer(application_gamepad))
-    {
-        SDL_GameControllerClose(application_gamepad);
-        application_gamepad = NULL;
-    }
-
-    SDL_GameController* controller = SDL_GameControllerOpen(device_index);
-    if (!IsValidPointer(controller))
-    {
-        Log("SDL_GameControllerOpen failed for device_index %d", device_index);
-        SDL_ERROR("SDL_GameControllerOpen");
-        return;
-    }
-
-    application_gamepad = controller;
-    Debug("Game controller %d assigned", device_index);
+    return true;
 }
 
 static bool sdl_init(void)
 {
     Debug("Initializing SDL...");
 
-    InitPointer(application_gamepad);
-
-#if defined(_WIN32)
-    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
-    SDL_ERROR("SDL_SetHint SDL_HINT_WINDOWS_DPI_SCALING");
-#endif
-
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0)
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
     {
         SDL_ERROR("SDL_Init");
         return false;
     }
 
-    SDL_VERSION(&application_sdl_build_version);
-    SDL_GetVersion(&application_sdl_link_version);
+    int sdl_version = SDL_GetVersion();
+    application_sdl_version_major = SDL_VERSIONNUM_MAJOR(sdl_version);
+    application_sdl_version_minor = SDL_VERSIONNUM_MINOR(sdl_version);
+    application_sdl_version_patch = SDL_VERSIONNUM_MICRO(sdl_version);
 
-    Log("Using SDL %d.%d.%d (build)", application_sdl_build_version.major, application_sdl_build_version.minor, application_sdl_build_version.patch);
-    Log("Using SDL %d.%d.%d (link) ", application_sdl_link_version.major, application_sdl_link_version.minor, application_sdl_link_version.patch);
+    Log("Using SDL %d.%d.%d", application_sdl_version_major, application_sdl_version_minor, application_sdl_version_patch);
 
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BUFFER_SIZE, 32);
+    SDL_GL_SetAttribute(SDL_GL_FLOATBUFFERS, 0);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+#if defined(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE)
+    SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, 0);
+#endif
+#if defined(__APPLE__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+#else
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+#endif
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
     if (config_emulator.maximized)
         window_flags = (SDL_WindowFlags)(window_flags | SDL_WINDOW_MAXIMIZED);
 
-    application_sdl_window = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, config_emulator.window_width, config_emulator.window_height, window_flags);
+    float content_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    if (content_scale <= 0.0f)
+        content_scale = 1.0f;
+
+    application_sdl_window = SDL_CreateWindow(WINDOW_TITLE, (int)(config_emulator.window_width * content_scale), (int)(config_emulator.window_height * content_scale), window_flags);
 
     if (!application_sdl_window)
     {
@@ -314,130 +326,44 @@ static bool sdl_init(void)
         return false;
     }
 
-    gl_context = SDL_GL_CreateContext(application_sdl_window);
+    SDL_SetWindowPosition(application_sdl_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
-    if (!gl_context)
+    display_gl_context = SDL_GL_CreateContext(application_sdl_window);
+
+    if (!display_gl_context)
     {
         SDL_ERROR("SDL_GL_CreateContext");
         return false;
     }
 
-    SDL_GL_MakeCurrent(application_sdl_window, gl_context);
+    SDL_GL_MakeCurrent(application_sdl_window, display_gl_context);
     SDL_ERROR("SDL_GL_MakeCurrent");
 
 #if defined(__APPLE__)
-    SDL_SysWMinfo info;
-    SDL_VERSION(&info.version);
-    if (SDL_GetWindowWMInfo(application_sdl_window, &info))
+    void* nswindow = (void*)SDL_GetPointerProperty(SDL_GetWindowProperties(application_sdl_window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+    if (nswindow)
     {
-        void* nswindow = info.info.cocoa.window;
         macos_nswindow = nswindow;
         macos_fullscreen_observer = macos_install_fullscreen_observer(nswindow, on_enter_fullscreen, on_exit_fullscreen);
     }
 #endif
 
-    SDL_GL_SetSwapInterval(0);
-    SDL_ERROR("SDL_GL_SetSwapInterval");
+    display_set_vsync(config_video.sync);
+    display_check_mixed_refresh_rates();
 
-    SDL_SetWindowMinimumSize(application_sdl_window, 500, 300);
+    SDL_SetWindowMinimumSize(application_sdl_window, (int)(500 * content_scale), (int)(300 * content_scale));
 
-    int w, h;
-    int display_w, display_h;
-    SDL_GetWindowSize(application_sdl_window, &w, &h);
-    SDL_GL_GetDrawableSize(application_sdl_window, &display_w, &display_h);
-    
-    if (w > 0 && h > 0)
-    {
-        float scale_w = (float)display_w / w;
-        float scale_h = (float)display_h / h;
-
-        application_display_scale = (scale_w > scale_h) ? scale_w : scale_h;
-    }
-
-    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
-    SDL_ERROR("SDL_EventState SDL_DROPFILE");
-
-    sdl_load_gamepad_mappings();
-    sdl_add_gamepads();
+    float display_scale = SDL_GetWindowDisplayScale(application_sdl_window);
+    Log("Display scale: %.2f", display_scale);
 
     return true;
 }
 
 static void sdl_destroy(void)
 {
-    SDL_GameControllerClose(application_gamepad);
-    SDL_GL_DeleteContext(gl_context);
+    SDL_GL_DestroyContext(display_gl_context);
     SDL_DestroyWindow(application_sdl_window);
     SDL_Quit();
-}
-
-static void sdl_load_gamepad_mappings(void)
-{
-    std::string db_path;
-    char exe_path[1024] = { };
-    get_executable_path(exe_path, sizeof(exe_path));
-
-    if (exe_path[0] != '\0')
-    {
-        db_path = std::string(exe_path) + "/gamecontrollerdb.txt";
-    }
-    else
-    {
-        db_path = "gamecontrollerdb.txt";
-    }
-
-    std::ifstream file;
-    open_ifstream_utf8(file, db_path.c_str(), std::ios::in);
-    if (!file.is_open())
-    {
-        open_ifstream_utf8(file, "gamecontrollerdb.txt", std::ios::in);
-    }
-
-    int added_mappings = 0;
-    int updated_mappings = 0;
-    int line_number = 0;
-    char platform_field[64] = { };
-    snprintf(platform_field, 64, "platform:%s", SDL_GetPlatform());
-    if (file.is_open())
-    {
-        Debug("Loading gamecontrollerdb.txt file");
-        std::string line;
-        while (std::getline(file, line))
-        {
-            size_t comment = line.find_first_of('#');
-            if (comment != std::string::npos)
-                line = line.substr(0, comment);
-            line = line.erase(0, line.find_first_not_of(" \t\r\n"));
-            line = line.erase(line.find_last_not_of(" \t\r\n") + 1);
-            while (line[0] == ' ')
-                line = line.substr(1);
-            if (line.empty())
-                continue;
-            if ((line.find("platform:") != std::string::npos) && (line.find(platform_field) == std::string::npos))
-                continue;
-            int result = SDL_GameControllerAddMapping(line.c_str());
-            if (result == 1)
-                added_mappings++;
-            else if (result == 0)
-                updated_mappings++;
-            else if (result == -1)
-            {
-                Error("Unable to load game controller mapping in line %d from gamecontrollerdb.txt", line_number);
-                SDL_ERROR("SDL_GameControllerAddMapping");
-            }
-            line_number++;
-        }
-        file.close();
-    }
-    else
-    {
-        Error("Game controller database not found (gamecontrollerdb.txt)!!");
-        return;
-    }
-    Log("Added %d new game controller mappings from gamecontrollerdb.txt", added_mappings);
-    Log("Updated %d game controller mappings from gamecontrollerdb.txt", updated_mappings);
-    application_added_gamepad_mappings = added_mappings;
-    application_updated_gamepad_mappings = updated_mappings;
 }
 
 static void handle_mouse_cursor(void)
@@ -446,7 +372,7 @@ static void handle_mouse_cursor(void)
         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
     else if (!config_debug.debug && config_emulator.fullscreen && !config_emulator.always_show_menu)
     {
-        Uint32 now = SDL_GetTicks();
+        Uint64 now = SDL_GetTicks();
 
         if ((now - mouse_last_motion_time) < mouse_hide_timeout_ms)
             ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
@@ -469,43 +395,67 @@ static void handle_menu(void)
         application_show_menu = true;
 }
 
+static void handle_single_instance(void)
+{
+    if (!config_debug.single_instance || !single_instance_is_primary())
+        return;
+
+    single_instance_poll();
+
+    static char s_pending_rom_path[4096];
+    static char s_pending_symbol_path[4096];
+    if (single_instance_get_pending_load(s_pending_rom_path, sizeof(s_pending_rom_path), s_pending_symbol_path, sizeof(s_pending_symbol_path)))
+    {
+        if (s_pending_rom_path[0] != '\0')
+            gui_load_rom(s_pending_rom_path);
+        if (s_pending_symbol_path[0] != '\0')
+        {
+            gui_debug_reset_symbols();
+            gui_debug_load_symbols_file(s_pending_symbol_path);
+        }
+    }
+}
+
 static void sdl_events(void)
 {
     SDL_Event event;
 
     while (SDL_PollEvent(&event))
     {
+        bool file_dialog_active = gui_file_dialog_is_active();
+
         sdl_events_quit(&event);
 
         if (running)
         {
             sdl_events_app(&event);
 
-            ImGui_ImplSDL2_ProcessEvent(&event);
+            if (!file_dialog_active)
+                ImGui_ImplSDL3_ProcessEvent(&event);
 
-            if (!gui_in_use)
+            if (!gui_in_use && !file_dialog_active)
             {
-                sdl_events_emu(&event);
-                sdl_events_shortcuts_gui(&event);
+                events_emu(&event);
+                events_shortcuts(&event);
             }
         }
     }
 
     if (!gui_in_use)
     {
-        input_check_gamepad_shortcuts();
+        gamepad_check_shortcuts();
     }
 }
 
 static void sdl_events_quit(const SDL_Event* event)
 {
-    if (event->type == SDL_QUIT)
+    if (event->type == SDL_EVENT_QUIT)
     {
         running = false;
         return;
     }
 
-    if (event->type == SDL_WINDOWEVENT && event->window.event == SDL_WINDOWEVENT_CLOSE && event->window.windowID == SDL_GetWindowID(application_sdl_window))
+    if (event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event->window.windowID == SDL_GetWindowID(application_sdl_window))
     {
         running = false;
         return;
@@ -516,566 +466,82 @@ static void sdl_events_app(const SDL_Event* event)
 {
     switch (event->type)
     {
-        case (SDL_DROPFILE):
+        case SDL_EVENT_DROP_FILE:
         {
-            char* dropped_filedir = event->drop.file;
+            const char* dropped_filedir = event->drop.data;
             gui_load_rom(dropped_filedir);
-            SDL_free(dropped_filedir);
-            SDL_SetWindowInputFocus(application_sdl_window);
+            SDL_RaiseWindow(application_sdl_window);
             break;
         }
-        case SDL_WINDOWEVENT:
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
         {
-            switch (event->window.event)
+            display_set_vsync(config_video.sync);
+            if (config_emulator.pause_when_inactive && !paused_when_focus_lost)
+                emu_resume();
+            break;
+        }
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+        {
+            display_set_vsync(false);
+            bool gdb_active = g_gdb_interface && g_gdb_interface->IsActive();
+            if (config_emulator.pause_when_inactive && !gdb_active)
             {
-                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                paused_when_focus_lost = emu_is_paused();
+                emu_pause();
+            }
+            break;
+        }
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        {
+            SDL_DisplayID new_display = SDL_GetDisplayForWindow(application_sdl_window);
+            if (new_display != current_display_id)
+            {
+                current_display_id = new_display;
+                display_check_mixed_refresh_rates();
+                if (config_video.sync && !display_is_vsync_forced_off())
+                    display_recreate_gl_context();
+                else
                 {
-                    if (config_emulator.pause_when_inactive && !paused_when_focus_lost)
-                        emu_resume();
-                    break;
-                }
-                case SDL_WINDOWEVENT_FOCUS_LOST:
-                {
-                    // Don't pause when GDB is actively debugging - we need to keep running
-                    bool gdb_active = g_gdb_interface && g_gdb_interface->IsActive();
-                    if (config_emulator.pause_when_inactive && !gdb_active)
-                    {
-                        paused_when_focus_lost = emu_is_paused();
-                        emu_pause();
-                    }
-                    break;
+                    display_request_gl_context_recreate();
+                    display_update_frame_pacing();
                 }
             }
             break;
         }
-        case (SDL_MOUSEMOTION):
+        case SDL_EVENT_DISPLAY_ADDED:
+        case SDL_EVENT_DISPLAY_REMOVED:
+        {
+            display_check_mixed_refresh_rates();
+            break;
+        }
+        case SDL_EVENT_MOUSE_MOTION:
         {
             mouse_last_motion_time = SDL_GetTicks();
             break;
         }
-        case SDL_CONTROLLERDEVICEADDED:
+        case SDL_EVENT_GAMEPAD_ADDED:
         {
-            sdl_add_gamepads();
+            gamepad_add();
             break;
         }
-        case SDL_CONTROLLERDEVICEREMOVED:
+        case SDL_EVENT_GAMEPAD_REMOVED:
         {
-            sdl_remove_gamepad(event->cdevice.which);
+            gamepad_remove(event->gdevice.which);
             break;
-        }
-    }
-}
-
-static bool check_hotkey(const SDL_Event* event, const config_Hotkey& hotkey, bool allow_repeat)
-{
-    if (event->type != SDL_KEYDOWN)
-        return false;
-
-    if (!allow_repeat && event->key.repeat != 0)
-        return false;
-
-    if (event->key.keysym.scancode != hotkey.key)
-        return false;
-
-    SDL_Keymod mods = (SDL_Keymod)event->key.keysym.mod;
-    SDL_Keymod expected = hotkey.mod;
-
-    SDL_Keymod mods_normalized = (SDL_Keymod)0;
-    if (mods & (KMOD_LCTRL | KMOD_RCTRL)) mods_normalized = (SDL_Keymod)(mods_normalized | KMOD_CTRL);
-    if (mods & (KMOD_LSHIFT | KMOD_RSHIFT)) mods_normalized = (SDL_Keymod)(mods_normalized | KMOD_SHIFT);
-    if (mods & (KMOD_LALT | KMOD_RALT)) mods_normalized = (SDL_Keymod)(mods_normalized | KMOD_ALT);
-    if (mods & (KMOD_LGUI | KMOD_RGUI)) mods_normalized = (SDL_Keymod)(mods_normalized | KMOD_GUI);
-
-    SDL_Keymod expected_normalized = (SDL_Keymod)0;
-    if (expected & (KMOD_LCTRL | KMOD_RCTRL | KMOD_CTRL)) expected_normalized = (SDL_Keymod)(expected_normalized | KMOD_CTRL);
-    if (expected & (KMOD_LSHIFT | KMOD_RSHIFT | KMOD_SHIFT)) expected_normalized = (SDL_Keymod)(expected_normalized | KMOD_SHIFT);
-    if (expected & (KMOD_LALT | KMOD_RALT | KMOD_ALT)) expected_normalized = (SDL_Keymod)(expected_normalized | KMOD_ALT);
-    if (expected & (KMOD_LGUI | KMOD_RGUI | KMOD_GUI)) expected_normalized = (SDL_Keymod)(expected_normalized | KMOD_GUI);
-
-    return mods_normalized == expected_normalized;
-}
-
-static void sdl_events_shortcuts_gui(const SDL_Event* event)
-{
-    if (event->type != SDL_KEYDOWN)
-        return;
-
-    // Check special case hotkeys first
-    if (check_hotkey(event, config_hotkeys[config_HotkeyIndex_Quit], false))
-    {
-        application_trigger_quit();
-        return;
-    }
-
-    if (check_hotkey(event, config_hotkeys[config_HotkeyIndex_Fullscreen], false))
-    {
-        config_emulator.fullscreen = !config_emulator.fullscreen;
-        application_trigger_fullscreen(config_emulator.fullscreen);
-        return;
-    }
-
-    // Check slot selection hotkeys
-    for (int i = 0; i < 5; i++)
-    {
-        if (check_hotkey(event, config_hotkeys[config_HotkeyIndex_SelectSlot1 + i], false))
-        {
-            config_emulator.save_slot = i;
-            return;
-        }
-    }
-
-    // Check all hotkeys mapped to gui shortcuts
-    for (int i = 0; i < GUI_HOTKEY_MAP_COUNT; i++)
-    {
-        if (gui_hotkey_map[i].shortcut >= 0 && check_hotkey(event, config_hotkeys[gui_hotkey_map[i].config_index], gui_hotkey_map[i].allow_repeat))
-        {
-            gui_shortcut((gui_ShortCutEvent)gui_hotkey_map[i].shortcut);
-            return;
-        }
-    }
-
-    // Fixed hotkeys for debug copy/paste/select operations
-    int key = event->key.keysym.scancode;
-    SDL_Keymod mods = (SDL_Keymod)event->key.keysym.mod;
-
-    if (event->key.repeat == 0 && key == SDL_SCANCODE_A && (mods & KMOD_CTRL))
-    {
-        gui_shortcut(gui_ShortcutDebugSelectAll);
-        return;
-    }
-
-    if (event->key.repeat == 0 && key == SDL_SCANCODE_C && (mods & KMOD_CTRL))
-    {
-        gui_shortcut(gui_ShortcutDebugCopy);
-        return;
-    }
-
-    if (event->key.repeat == 0 && key == SDL_SCANCODE_V && (mods & KMOD_CTRL))
-    {
-        gui_shortcut(gui_ShortcutDebugPaste);
-        return;
-    }
-
-    // ESC to exit fullscreen
-    if (event->key.repeat == 0 && key == SDL_SCANCODE_ESCAPE)
-    {
-        if (config_emulator.fullscreen && !config_emulator.always_show_menu)
-        {
-            config_emulator.fullscreen = false;
-            application_trigger_fullscreen(false);
-        }
-    }
-}
-
-static void sdl_events_emu(const SDL_Event* event)
-{
-    switch(event->type)
-    {
-        case SDL_CONTROLLERBUTTONDOWN:
-        {
-            if (!IsValidPointer(application_gamepad))
-                break;
-
-            SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(application_gamepad));
-
-            if (!config_input.gamepad)
-                break;
-
-            if (event->cbutton.which != id)
-                break;
-
-            if (event->cbutton.button == config_input.gamepad_A)
-                emu_key_pressed(GLYNX_KEY_A);
-            else if (event->cbutton.button == config_input.gamepad_B)
-                emu_key_pressed(GLYNX_KEY_B);
-            else if (event->cbutton.button == config_input.gamepad_pause)
-                emu_key_pressed(GLYNX_KEY_PAUSE);
-            else if (event->cbutton.button == config_input.gamepad_option1)
-                emu_key_pressed(GLYNX_KEY_OPTION1);
-            else if (event->cbutton.button == config_input.gamepad_option2)
-                emu_key_pressed(GLYNX_KEY_OPTION2);
-
-            if (config_input.gamepad_directional == 1)
-                break;
-
-            if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP)
-                emu_key_pressed(GLYNX_KEY_UP);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-                emu_key_pressed(GLYNX_KEY_DOWN);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)
-                emu_key_pressed(GLYNX_KEY_LEFT);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
-                emu_key_pressed(GLYNX_KEY_RIGHT);
-        }
-        break;
-
-        case SDL_CONTROLLERBUTTONUP:
-        {
-            if (!IsValidPointer(application_gamepad))
-                break;
-
-            SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(application_gamepad));
-
-            if (!config_input.gamepad)
-                break;
-
-            if (event->cbutton.which != id)
-                break;
-
-            if (event->cbutton.button == config_input.gamepad_A)
-                emu_key_released(GLYNX_KEY_A);
-            else if (event->cbutton.button == config_input.gamepad_B)
-                emu_key_released(GLYNX_KEY_B);
-            else if (event->cbutton.button == config_input.gamepad_pause)
-                emu_key_released(GLYNX_KEY_PAUSE);
-            else if (event->cbutton.button == config_input.gamepad_option1)
-                emu_key_released(GLYNX_KEY_OPTION1);
-            else if (event->cbutton.button == config_input.gamepad_option2)
-                emu_key_released(GLYNX_KEY_OPTION2);
-
-            if (config_input.gamepad_directional == 1)
-                break;
-
-            if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP)
-                emu_key_released(GLYNX_KEY_UP);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
-                emu_key_released(GLYNX_KEY_DOWN);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT)
-                emu_key_released(GLYNX_KEY_LEFT);
-            else if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
-                emu_key_released(GLYNX_KEY_RIGHT);
-        }
-        break;
-
-        case SDL_CONTROLLERAXISMOTION:
-        {
-            if (!IsValidPointer(application_gamepad))
-                break;
-
-            SDL_JoystickID id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(application_gamepad));
-
-            if (!config_input.gamepad)
-                break;
-
-            if (event->caxis.which != id)
-                break;
-
-            if (config_input.gamepad_directional == 1)
-            {
-                const int STICK_DEAD_ZONE = 8000;
-
-                if(event->caxis.axis == config_input.gamepad_x_axis)
-                {
-                    int x_motion = event->caxis.value * (config_input.gamepad_invert_x_axis ? -1 : 1);
-
-                    if (x_motion < -STICK_DEAD_ZONE)
-                        emu_key_pressed(GLYNX_KEY_LEFT);
-                    else if (x_motion > STICK_DEAD_ZONE)
-                        emu_key_pressed(GLYNX_KEY_RIGHT);
-                    else
-                    {
-                        emu_key_released(GLYNX_KEY_LEFT);
-                        emu_key_released(GLYNX_KEY_RIGHT);
-                    }
-                }
-                else if(event->caxis.axis == config_input.gamepad_y_axis)
-                {
-                    int y_motion = event->caxis.value * (config_input.gamepad_invert_y_axis ? -1 : 1);
-
-                    if (y_motion < -STICK_DEAD_ZONE)
-                        emu_key_pressed(GLYNX_KEY_UP);
-                    else if (y_motion > STICK_DEAD_ZONE)
-                        emu_key_pressed(GLYNX_KEY_DOWN);
-                    else
-                    {
-                        emu_key_released(GLYNX_KEY_UP);
-                        emu_key_released(GLYNX_KEY_DOWN);
-                    }
-                }
-            }
-
-            if (event->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || event->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
-            {
-                int vbtn = GAMEPAD_VBTN_AXIS_BASE + event->caxis.axis;
-                bool pressed = event->caxis.value > GAMEPAD_VBTN_AXIS_THRESHOLD;
-
-                if (config_input.gamepad_A == vbtn)
-                {
-                    if (pressed)
-                        emu_key_pressed(GLYNX_KEY_A);
-                    else
-                        emu_key_released(GLYNX_KEY_A);
-                }
-                else if (config_input.gamepad_B == vbtn)
-                {
-                    if (pressed)
-                        emu_key_pressed(GLYNX_KEY_B);
-                    else
-                        emu_key_released(GLYNX_KEY_B);
-                }
-                else if (config_input.gamepad_pause == vbtn)
-                {
-                    if (pressed)
-                        emu_key_pressed(GLYNX_KEY_PAUSE);
-                    else
-                        emu_key_released(GLYNX_KEY_PAUSE);
-                }
-                else if (config_input.gamepad_option1 == vbtn)
-                {
-                    if (pressed)
-                        emu_key_pressed(GLYNX_KEY_OPTION1);
-                    else
-                        emu_key_released(GLYNX_KEY_OPTION1);
-                }
-                else if (config_input.gamepad_option2 == vbtn)
-                {
-                    if (pressed)
-                        emu_key_pressed(GLYNX_KEY_OPTION2);
-                    else
-                        emu_key_released(GLYNX_KEY_OPTION2);
-                }
-            }
-        }
-        break;
-
-        case SDL_KEYDOWN:
-        {
-            if (event->key.repeat != 0)
-                break;
-
-            if (event->key.keysym.mod & KMOD_CTRL)
-                break;
-            if (event->key.keysym.mod & KMOD_SHIFT)
-                break;
-
-            int key = event->key.keysym.scancode;
-
-            if (key == config_input.key_left)
-                emu_key_pressed(GLYNX_KEY_LEFT);
-            else if (key == config_input.key_right)
-                emu_key_pressed(GLYNX_KEY_RIGHT);
-            else if (key == config_input.key_up)
-                emu_key_pressed(GLYNX_KEY_UP);
-            else if (key == config_input.key_down)
-                emu_key_pressed(GLYNX_KEY_DOWN);
-            else if (key == config_input.key_A)
-                emu_key_pressed(GLYNX_KEY_A);
-            else if (key == config_input.key_B)
-                emu_key_pressed(GLYNX_KEY_B);
-            else if (key == config_input.key_pause)
-                emu_key_pressed(GLYNX_KEY_PAUSE);
-            else if (key == config_input.key_option1)
-                emu_key_pressed(GLYNX_KEY_OPTION1);
-            else if (key == config_input.key_option2)
-                emu_key_pressed(GLYNX_KEY_OPTION2);
-        }
-        break;
-
-        case SDL_KEYUP:
-        {
-            int key = event->key.keysym.scancode;
-
-            if (key == config_input.key_left)
-                emu_key_released(GLYNX_KEY_LEFT);
-            else if (key == config_input.key_right)
-                emu_key_released(GLYNX_KEY_RIGHT);
-            else if (key == config_input.key_up)
-                emu_key_released(GLYNX_KEY_UP);
-            else if (key == config_input.key_down)
-                emu_key_released(GLYNX_KEY_DOWN);
-            else if (key == config_input.key_A)
-                emu_key_released(GLYNX_KEY_A);
-            else if (key == config_input.key_B)
-                emu_key_released(GLYNX_KEY_B);
-            else if (key == config_input.key_pause)
-                emu_key_released(GLYNX_KEY_PAUSE);
-            else if (key == config_input.key_option1)
-                emu_key_released(GLYNX_KEY_OPTION1);
-            else if (key == config_input.key_option2)
-                emu_key_released(GLYNX_KEY_OPTION2);
-        }
-        break;
-    }
-}
-
-static void input_check_gamepad_shortcuts(void)
-{
-    SDL_GameController* sdl_controller = application_gamepad;
-    if (!IsValidPointer(sdl_controller))
-        return;
-
-    for (int i = 0; i < config_HotkeyIndex_COUNT; i++)
-    {
-        int button_mapping = config_input_gamepad_shortcuts.gamepad_shortcuts[i];
-        if (button_mapping == SDL_CONTROLLER_BUTTON_INVALID)
-            continue;
-
-        bool button_pressed = input_get_button(sdl_controller, button_mapping);
-
-        if (button_pressed && !input_gamepad_shortcut_prev[i])
-        {
-            if (i >= config_HotkeyIndex_SelectSlot1 && i <= config_HotkeyIndex_SelectSlot5)
-            {
-                config_emulator.save_slot = i - config_HotkeyIndex_SelectSlot1;
-            }
-            else
-            {
-                for (int j = 0; j < GUI_HOTKEY_MAP_COUNT; j++)
-                {
-                    if (gui_hotkey_map[j].config_index == i)
-                    {
-                        gui_shortcut((gui_ShortCutEvent)gui_hotkey_map[j].shortcut);
-                        break;
-                    }
-                }
-            }
-        }
-
-        input_gamepad_shortcut_prev[i] = button_pressed;
-    }
-}
-
-static bool input_get_button(SDL_GameController* controller, int mapping)
-{
-    if (!IsValidPointer(controller))
-        return false;
-
-    if (mapping >= 0 && mapping < SDL_CONTROLLER_BUTTON_MAX)
-    {
-        return SDL_GameControllerGetButton(controller, (SDL_GameControllerButton)mapping) != 0;
-    }
-    else if (mapping >= GAMEPAD_VBTN_AXIS_BASE)
-    {
-        int axis = mapping - GAMEPAD_VBTN_AXIS_BASE;
-        Sint16 value = SDL_GameControllerGetAxis(controller, (SDL_GameControllerAxis)axis);
-        return value > GAMEPAD_VBTN_AXIS_THRESHOLD;
-    }
-
-    return false;
-}
-
-static void sdl_add_gamepads(void)
-{
-    if (IsValidPointer(application_gamepad))
-    {
-        SDL_Joystick* js = SDL_GameControllerGetJoystick(application_gamepad);
-
-        if (!IsValidPointer(js) || SDL_JoystickGetAttached(js) == SDL_FALSE)
-        {
-            SDL_GameControllerClose(application_gamepad);
-            application_gamepad = NULL;
-            Debug("Game controller closed when adding a new gamepad");
-        }
-    }
-
-    bool connected = IsValidPointer(application_gamepad);
-
-    if (connected)
-        return;
-
-    for (int i = 0; i < SDL_NumJoysticks(); i++)
-    {
-        if (!SDL_IsGameController(i))
-            continue;
-
-        SDL_GameController* controller = SDL_GameControllerOpen(i);
-        if (!IsValidPointer(controller))
-        {
-            Log("Warning: Unable to open game controller %d!\n", i);
-            SDL_ERROR("SDL_GameControllerOpen");
-            continue;
-        }
-
-        if (!connected)
-        {
-            application_gamepad = controller;
-            connected = true;
-            Debug("Game controller %d assigned to Player 1", i);
-        }
-        else
-        {
-            SDL_GameControllerClose(controller);
-            Debug("Game controller %d detected but all player slots are full", i);
-        }
-
-        if (connected)
-            break;
-    }
-}
-
-static void sdl_remove_gamepad(SDL_JoystickID instance_id)
-{
-    if (application_gamepad != NULL)
-    {
-        SDL_JoystickID current_id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(application_gamepad));
-        if (current_id == instance_id)
-        {
-            SDL_GameControllerClose(application_gamepad);
-            application_gamepad = NULL;
-            Debug("Game controller %d disconnected", instance_id);
         }
     }
 }
 
 static void run_emulator(void)
 {
+    if (!display_should_run_emu_frame())
+        return;
+
     config_emulator.paused = emu_is_paused();
     emu_audio_sync = config_audio.sync;
     emu_update();
-}
 
-static void render(void)
-{
-    renderer_begin_render();
-    ImGui_ImplSDL2_NewFrame();
-    gui_render();
-    renderer_render();
-    renderer_end_render();
-
-    SDL_GL_SwapWindow(application_sdl_window);
-}
-
-static void frame_throttle(void)
-{
-    if (emu_is_empty() || emu_is_paused() || emu_is_debug_idle() || !emu_is_audio_open() || config_emulator.ffwd)
-    {
-        Uint64 count_per_sec = SDL_GetPerformanceFrequency();
-        float elapsed = (float)(frame_time_end - frame_time_start) / (float)count_per_sec;
-        elapsed *= 1000.0f;
-
-        float min = 16.666f;
-
-        if (!emu_is_audio_open())
-        {
-            GLYNX_Runtime_Info runtime;
-        emu_get_runtime(runtime);
-            min = runtime.frame_time;
-        }
-
-        if (config_emulator.ffwd)
-        {
-            switch (config_emulator.ffwd_speed)
-            {
-                case 0:
-                    min = 16.666f / 1.5f;
-                    break;
-                case 1: 
-                    min = 16.666f / 2.0f;
-                    break;
-                case 2:
-                    min = 16.666f / 2.5f;
-                    break;
-                case 3:
-                    min = 16.666f / 3.0f;
-                    break;
-                default:
-                    min = 0.0f;
-            }
-        }
-
-        if (elapsed < min)
-            SDL_Delay((Uint32)(min - elapsed));
-    }
+    display_update_vsync_state();
 }
 
 static void save_window_size(void)
@@ -1084,18 +550,11 @@ static void save_window_size(void)
     {
         int width, height;
         SDL_GetWindowSize(application_sdl_window, &width, &height);
-        config_emulator.window_width = width;
-        config_emulator.window_height = height;
-        config_emulator.maximized = (SDL_GetWindowFlags(application_sdl_window) & SDL_WINDOW_MAXIMIZED);
-    }
-}
-
-static void log_sdl_error(const char* action, const char* file, int line)
-{
-    const char* error = SDL_GetError();
-    if (error && error[0] != '\0')
-    {
-        Log("SDL Error: %s (%s:%d) - %s", action, file, line, error);
-        SDL_ClearError();
+        float content_scale = SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(application_sdl_window));
+        if (content_scale <= 0.0f)
+            content_scale = 1.0f;
+        config_emulator.window_width = (int)(width / content_scale);
+        config_emulator.window_height = (int)(height / content_scale);
+        config_emulator.maximized = (SDL_GetWindowFlags(application_sdl_window) & SDL_WINDOW_MAXIMIZED) != 0;
     }
 }

@@ -47,11 +47,13 @@ EXTERN u8* emu_frame_buffer;
 EXTERN GLYNX_SaveState_Header emu_savestates[5];
 EXTERN GLYNX_SaveState_Screenshot emu_savestates_screenshots[5];
 EXTERN u8* emu_debug_sprite_buffers[64];
-EXTERN u8* emu_debug_framebuffer[2];
+EXTERN u8* emu_debug_framebuffer[5];
+EXTERN u32 emu_collision_palette[16];
 EXTERN int emu_debug_sprite_widths[64];
 EXTERN int emu_debug_sprite_heights[64];
 EXTERN Debug_Command emu_debug_command;
 EXTERN bool emu_debug_pc_changed;
+EXTERN int emu_debug_step_frames_pending;
 
 EXTERN bool emu_audio_sync;
 EXTERN bool emu_debug_disable_breakpoints;
@@ -72,6 +74,7 @@ EXTERN bool emu_is_bios_loaded(void);
 EXTERN GLYNX_Bios_State emu_load_bios(const char* file_path);
 EXTERN void emu_reset(void);
 EXTERN void emu_force_rotation(int rotation);
+EXTERN void emu_force_console_type(int console_type);
 EXTERN void emu_audio_mute(bool mute);
 EXTERN void emu_audio_set_volume(int channel, float volume);
 EXTERN void emu_audio_set_lowpass_cutoff(float fc);
@@ -96,9 +99,17 @@ EXTERN void emu_debug_break(void);
 EXTERN void emu_debug_continue(void);
 EXTERN void emu_debug_set_callback(GearlynxCore::GLYNX_Debug_Callback callback);
 EXTERN void emu_save_screenshot(const char* file_path);
+EXTERN int emu_get_screenshot_png(unsigned char** out_buffer);
+EXTERN int emu_get_framebuffer_png(int buffer_index, unsigned char** out_buffer);
 EXTERN void emu_start_vgm_recording(const char* file_path);
 EXTERN void emu_stop_vgm_recording(void);
 EXTERN bool emu_is_vgm_recording(void);
+EXTERN void emu_mcp_set_transport(int mode, int tcp_port);
+EXTERN void emu_mcp_start(void);
+EXTERN void emu_mcp_stop(void);
+EXTERN bool emu_mcp_is_running(void);
+EXTERN int emu_mcp_get_transport_mode(void);
+EXTERN void emu_mcp_pump_commands(void);
 
 #undef EMU_IMPORT
 #undef EXTERN

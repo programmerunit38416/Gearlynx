@@ -20,6 +20,9 @@
 #ifndef GUI_DEBUG_MEMORY_H
 #define GUI_DEBUG_MEMORY_H
 
+#include <iostream>
+#include "gearlynx.h"
+
 #ifdef GUI_DEBUG_MEMORY_IMPORT
     #define EXTERN
 #else
@@ -31,14 +34,20 @@ enum Memory_Editor_Tabs
     MEMORY_EDITOR_RAM = 0,
     MEMORY_EDITOR_ZERO_PAGE,
     MEMORY_EDITOR_STACK,
-    MEMORY_EDITOR_CART,
+    MEMORY_EDITOR_BANK0,
+    MEMORY_EDITOR_BANK0A,
+    MEMORY_EDITOR_BANK1,
+    MEMORY_EDITOR_BANK1A,
     MEMORY_EDITOR_BIOS,
+    MEMORY_EDITOR_EEPROM,
     MEMORY_EDITOR_MAX
 };
 
 EXTERN void gui_debug_memory_init(void);
 EXTERN void gui_debug_memory_destroy(void);
 EXTERN void gui_debug_memory_reset(void);
+EXTERN void gui_debug_reset_memory_bookmarks(void);
+EXTERN void gui_debug_reset_memory_watches(void);
 EXTERN void gui_debug_window_memory(void);
 EXTERN void gui_debug_memory_search_window(void);
 EXTERN void gui_debug_memory_watches_window(void);
@@ -48,6 +57,20 @@ EXTERN void gui_debug_memory_paste(void);
 EXTERN void gui_debug_memory_select_all(void);
 EXTERN void gui_debug_memory_goto(int editor, int address);
 EXTERN void gui_debug_memory_save_dump(const char* file_path, bool binary);
+EXTERN void gui_debug_memory_select_range(int editor, int start_address, int end_address);
+EXTERN void gui_debug_memory_set_selection_value(int editor, u8 value);
+EXTERN void gui_debug_memory_add_bookmark(int editor, int address, const char* name);
+EXTERN void gui_debug_memory_remove_bookmark(int editor, int address);
+EXTERN void gui_debug_memory_add_watch(int editor, int address, const char* notes, int size);
+EXTERN void gui_debug_memory_open_watch_popup(int editor, int address, const char* notes);
+EXTERN void gui_debug_memory_remove_watch(int editor, int address);
+EXTERN int gui_debug_memory_get_bookmarks(int editor, void** bookmarks_ptr);
+EXTERN int gui_debug_memory_get_watches(int editor, void** watches_ptr);
+EXTERN void gui_debug_memory_get_selection(int editor, int* start, int* end);
+EXTERN void gui_debug_memory_search_capture(int editor);
+EXTERN int gui_debug_memory_search(int editor, int op, int compare_type, int compare_value, int data_type, void** results_ptr);
+EXTERN void gui_debug_memory_save_settings(std::ostream& stream);
+EXTERN void gui_debug_memory_load_settings(std::istream& stream);
 
 #undef GUI_DEBUG_MEMORY_IMPORT
 #undef EXTERN
